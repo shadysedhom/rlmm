@@ -1,5 +1,13 @@
-numpy
-pandas
-asyncio
-websockets
-pytest
+numpy  # working w/ data
+pandas  # working w/ data
+asyncio # for parallel processing
+websockets # for streaming connections
+pytest # for testing
+orjson # for json parsing
+pyarrow # for data serialization
+aiohttp # for downloading data
+requests # for downloading data
+tqdm # for progress bars
+kagglehub # for downloading data
+
+
