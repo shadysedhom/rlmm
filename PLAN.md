@@ -1,0 +1,7 @@
+Phase 0 Environment + repo skeleton
+Phase 1 Collect ~ 2 weeks of real-time order-book data
+Phase 2 Build a simple playback (simulation) engine
+Phase 3 Add performance metrics (Sharpe, max drawdown, etc.)
+Phase 4 Implement & test a baseline quoting strategy (no ML yet)
+Phase 5 Plug in an RL agent (Stable-Baselines3 PPO)
+Phase 6 Visualize the results & write a report to reflect

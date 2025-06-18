@@ -1,0 +1,16 @@
+2025-06-18 21:48:37.811 [INFO] Playback started
+2025-06-18 21:48:37.812 [INFO] Output directory created
+2025-06-18 21:48:37.812 [INFO] SnapshotLoader initialized
+2025-06-18 21:48:37.812 [INFO] Processing file
+2025-06-18 21:48:37.813 [INFO] Tick size detected
+2025-06-18 21:48:37.814 [INFO] SnapshotLoader initialized
+2025-06-18 21:48:37.815 [INFO] Strategy loaded
+2025-06-18 21:48:37.815 [INFO] Strategy instantiated
+2025-06-18 21:48:37.815 [INFO] BookSimulator initialized
+2025-06-18 21:48:37.815 [INFO] Processing file
+2025-06-18 21:48:37.816 [DEBUG] Strategy generated quote
+2025-06-18 21:48:37.816 [INFO] Order placed with latency
+2025-06-18 21:48:37.816 [INFO] Order placed with latency
+2025-06-18 21:48:37.817 [ERROR] Duplicate order IDs detected
+2025-06-18 21:48:37.817 [ERROR] Validation error: '>' not supported between instances of 'str' and 'float'
+2025-06-18 21:48:37.817 [DEBUG] Mark-to-market update

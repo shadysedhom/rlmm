@@ -1,0 +1,10 @@
+Strategy Comparison Results
+=========================
+
+Strategy        | Parameters            | P&L     | Inventory | Fills | Rebates | Adverse Selection
+----------------|-----------------------|---------|-----------|-------|---------|------------------
+mid_spread      |                       |  1.6749 | -0.121000 |   523 |  1.7992 |           -0.1151
+skew_mid_spread | gamma=0.1,size=0.001  |  8.0946 | -0.001000 |  2405 |  8.2727 |           -0.2735
+skew_mid_spread | gamma=0.2,size=0.001  |  8.0946 | -0.001000 |  2405 |  8.2727 |           -0.2735
+skew_mid_spread | gamma=0.1,size=0.002  | 15.2141 | -0.002000 |  2261 | 15.5548 |           -0.5172
+skew_mid_spread | gamma=0.05,size=0.001 |  8.0872 |  0.001000 |  2403 |  8.2659 |           -0.2733

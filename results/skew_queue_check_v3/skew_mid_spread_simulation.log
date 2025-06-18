@@ -1,0 +1,15 @@
+2025-06-18 21:47:22.532 [INFO] Playback started
+2025-06-18 21:47:22.533 [INFO] Output directory created
+2025-06-18 21:47:22.533 [INFO] SnapshotLoader initialized
+2025-06-18 21:47:22.534 [INFO] Processing file
+2025-06-18 21:47:22.534 [INFO] Tick size detected
+2025-06-18 21:47:22.534 [INFO] SnapshotLoader initialized
+2025-06-18 21:47:22.536 [INFO] Strategy loaded
+2025-06-18 21:47:22.536 [INFO] Strategy instantiated
+2025-06-18 21:47:22.536 [INFO] BookSimulator initialized
+2025-06-18 21:47:22.536 [INFO] Processing file
+2025-06-18 21:47:22.537 [DEBUG] Strategy generated quote
+2025-06-18 21:47:22.539 [INFO] Order placed with latency
+2025-06-18 21:47:22.539 [INFO] Order placed with latency
+2025-06-18 21:47:22.539 [ERROR] Validation error: '>' not supported between instances of 'str' and 'float'
+2025-06-18 21:47:22.539 [DEBUG] Mark-to-market update

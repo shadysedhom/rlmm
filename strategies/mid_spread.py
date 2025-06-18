@@ -11,7 +11,7 @@ class Strategy:
     def __init__(self, size: float = 0.001):
         self.size = size
 
-    def on_snapshot(self, snapshot: Dict[str, Any]) -> Dict[str, float]:
+    def on_snapshot(self, snapshot: Dict[str, Any], inventory: float = 0.0) -> Dict[str, float]:
         best_bid = snapshot["bids"][0][0]
         best_ask = snapshot["asks"][0][0]
         spread = best_ask - best_bid

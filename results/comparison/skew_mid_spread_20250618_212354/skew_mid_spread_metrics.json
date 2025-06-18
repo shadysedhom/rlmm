@@ -1,0 +1,18 @@
+{
+  "final_pnl": 8.097473632450985,
+  "final_inventory": -0.002,
+  "fill_count": 2406,
+  "pnl_attribution": {
+    "spread_capture": 0.0,
+    "inventory_moves": 0.0,
+    "fees": 0.0,
+    "rebates": 8.276174832449968,
+    "adverse_selection": -0.2736012500016681
+  },
+  "strategy": "skew_mid_spread",
+  "strategy_kwargs": {
+    "gamma": 0.05,
+    "size": 0.001
+  },
+  "snapshots_processed": 5000
+}
