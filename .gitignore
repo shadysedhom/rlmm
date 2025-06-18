@@ -1,0 +1,3 @@
+
+# Don't store data on Git (exceeds limits)
+/data/raw
