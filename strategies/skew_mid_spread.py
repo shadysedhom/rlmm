@@ -26,6 +26,8 @@ class Strategy:  # pylint: disable=too-few-public-methods
         size: float = 0.1,
         gamma: float = 0.1,
         max_inventory: float = 100.0,
+        use_ticks: bool = False,
+        clamp_ticks: int = 2,
     ):
         """Create a skewed mid-spread strategy.
 
@@ -35,10 +37,14 @@ class Strategy:  # pylint: disable=too-few-public-methods
                 inventory.  For BTC-USDT with 0.1 tick, gamma=0.1 means
                 each 1 BTC of inventory shifts quotes by one tick.
             max_inventory: Maximum inventory size to consider for position sizing.
+            use_ticks: If True, interpret gamma in ticks/BTC
+            clamp_ticks: minimum distance heavy side must stay behind touch
         """
         self.size = size
         self.gamma = gamma
         self.max_inventory = max_inventory
+        self.use_ticks = use_ticks
+        self.clamp_ticks = clamp_ticks
 
     # ------------------------------------------------------------------
     # Public API expected by engine.playback
@@ -50,21 +56,52 @@ class Strategy:  # pylint: disable=too-few-public-methods
     ) -> Dict[str, float]:
         """Generate quotes based on current order book snapshot and inventory."""
         mid = snapshot["mid"]
-        spread = snapshot["asks"][0][0] - snapshot["bids"][0][0]
-        
-        # Inventory-based position sizing: reduce size when inventory is large
-        # This creates more realistic volatility as large positions are harder to manage
+        best_bid = snapshot["bids"][0][0]
+        best_ask = snapshot["asks"][0][0]
+        spread = best_ask - best_bid
+
+        # Derive tick size from first two bid levels if possible
+        if len(snapshot["bids"]) >= 2:
+            tick = round(snapshot["bids"][0][0] - snapshot["bids"][1][0], 8)
+            if tick <= 0:
+                tick = 0.01  # fallback
+        else:
+            tick = 0.01
+
+        # Position sizing depending on inventory magnitude
         inventory_factor = max(0.1, 1.0 - abs(inventory) / self.max_inventory)
         adjusted_size = self.size * inventory_factor
-        
-        # Skew quotes based on inventory to encourage mean reversion
-        skew = self.gamma * inventory * spread
-        
-        bid_price = mid - spread/2 + skew
-        ask_price = mid + spread/2 + skew
-        
+
+        # ---------------- Skew -----------------
+        if self.use_ticks:
+            skew_px = self.gamma * inventory * tick
+        else:
+            skew_px = self.gamma * inventory * spread
+
+        bid_price = mid - spread / 2 - skew_px
+        ask_price = mid + spread / 2 - skew_px
+
+        # Round to tick grid
+        bid_price = round(bid_price / tick) * tick
+        ask_price = round(ask_price / tick) * tick
+
+        # --------------- Clamp heavy side ---------------
+        if inventory > 0:  # long → heavy side is bid
+            min_bid = best_bid - self.clamp_ticks * tick
+            if bid_price >= min_bid:
+                bid_price = min_bid
+        elif inventory < 0:  # short → heavy side is ask
+            min_ask = best_ask + self.clamp_ticks * tick
+            if ask_price <= min_ask:
+                ask_price = min_ask
+
+        # Ensure we never cross
+        if bid_price >= ask_price:
+            # Widen by one tick to maintain proper order
+            bid_price = ask_price - tick
+
         return {
             "bid_price": bid_price,
             "ask_price": ask_price,
-            "size": adjusted_size
+            "size": adjusted_size,
         } 

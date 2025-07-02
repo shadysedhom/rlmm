@@ -37,8 +37,8 @@ class BookSimulator:
         tick_size: float,
         cancel_if_behind: bool = True,
         max_ticks_away: int = 3,
-        maker_rebate: float = 0.0001,  # +0.01% realistic Binance VIP0
-        taker_fee: float = 0.0004,     # -0.04%
+        maker_fee: float = 0.0002,  # 0.02% maker fee for regular users (positive = cost, negative = rebate)
+        taker_fee: float = 0.0005,     # 0.05% taker fee for regular users
         latency_mean_ms: float = 20.0,
         latency_std_ms: float = 5.0,
         min_keep_filled_frac: float = 0.25,
@@ -48,19 +48,26 @@ class BookSimulator:
         execution_slippage_bps: float = 0.5,  # 0.5 bps average slippage
         queue_position_uncertainty: float = 0.1,  # 10% uncertainty in queue position
         # Queue competition parameters
-        min_competitors: int = 1,             # Minimum competing orders per price level
-        max_competitors: int = 5,             # Maximum competing orders per price level
+        min_competitors: int = 3,             # Minimum competing orders per price level (tougher)
+        max_competitors: int = 8,             # Maximum competing orders per price level (tougher)
         competitor_order_size: float = 0.05,  # Average size of competing orders (BTC)
+        competition_intensity: float = 0.5,   # 0=no competition, 1=high competition
         # API and infrastructure parameters
-        api_rate_limit_orders_per_sec: int = 10,  # Binance limit: 10 orders/second
-        api_rate_limit_orders_per_10min: int = 100000,  # Binance limit: 100k orders/10min
+        api_rate_limit_orders_per_sec: int = 20,  # From Binance "Binance Futures provides rate limit adjustment flexibility via a volume-based tier system:
+        api_rate_limit_orders_per_10min: int = 24000, # The default rate limit per IP is 2,400/min, and the default order limit per account/sub-account is 1,200/min."
         maintenance_window_probability: float = 0.0001,  # 0.01% chance of maintenance
         network_congestion_probability: float = 0.001,   # 0.1% chance of network issues
+        capital_base: float = 10000.0,  # Initial capital base
+        order_ttl_sec: float | None = None,
+        forced_liq_min_qty: float = 0.02,  # min BTC liquidated per taker trade
+        forced_liq_slip_bps_low: float = 0.0002,  # 2 bps lower bound for slip
+        forced_liq_slip_bps_high: float = 0.0008, # 8 bps upper bound for slip
+        funding_interval_sec: int | None = None,
     ):
         self.tick = tick_size
         self.cancel_if_behind = cancel_if_behind
         self.max_ticks_away = max_ticks_away
-        self.maker_rebate = maker_rebate
+        self.maker_fee = maker_fee  # positive cost, negative rebate
         self.taker_fee = taker_fee
         self.lat_mean = latency_mean_ms / 1000.0
         self.lat_std = latency_std_ms / 1000.0
@@ -87,13 +94,14 @@ class BookSimulator:
         self.last_10min_ts = None
         
         # Dynamic competition intensity (set in update)
-        self.competition_intensity = 0.5
+        self.competition_intensity = max(0.0, min(competition_intensity, 1.0))
         
         self.active_orders: List[Order] = []
         self.filled_orders: List[Order] = []  # Keep track of filled orders for validation
         self.inventory: float = 0.0
-        self.cash: float = 0.0
+        self.cash: float = capital_base  # Start with initial capital
         self.fills_count: int = 0
+        self.initial_capital = capital_base  # Store for P&L calculations
 
         # Orders waiting for activation due to latency
         self.pending_orders: List[dict] = []  # each dict keys: side, price, size, activate_ts
@@ -101,15 +109,15 @@ class BookSimulator:
         # PnL attribution
         self.pnl_components = {
             "inventory_moves": 0.0,
-            "fees": 0.0,
-            "rebates": 0.0,
+            "fees": 0.0,  # positive = cost, negative = rebate credit
+            "spread_capture": 0.0,
             "adverse_selection": 0.0,
-            "funding_rates": 0.0,  # New component for perpetual futures funding
+            "funding_rates": 0.0,
         }
         
         # Funding rate tracking for perpetual futures
         self.last_funding_ts = None
-        self.funding_interval = 8 * 3600  # 8 hours in seconds
+        self.funding_interval = funding_interval_sec if funding_interval_sec is not None else 8 * 3600  # default 8h
         self.funding_rate_mean = 0.0001   # 0.01% per 8h period (typical)
         self.funding_rate_std = 0.0002    # Volatility in funding rates
         
@@ -118,7 +126,7 @@ class BookSimulator:
         
         logger.info("BookSimulator initialized", 
                    tick_size=tick_size,
-                   maker_rebate=maker_rebate,
+                   maker_fee=maker_fee,
                    taker_fee=taker_fee,
                    latency_mean_ms=latency_mean_ms*1000,
                    latency_std_ms=latency_std_ms*1000,
@@ -128,6 +136,34 @@ class BookSimulator:
                    competition_intensity=self.competition_intensity,
                    min_competitors=min_competitors,
                    max_competitors=max_competitors)
+
+        self.orders_placed = 0
+        self.orders_placed_side = {"buy": 0, "sell": 0}
+        self.fills_side = {"buy": 0, "sell": 0}
+        self.fill_latencies = []  # seconds
+        self.fill_queue_positions = []
+        self.order_lifetimes = []  # seconds
+        self.competition_sizes = []
+        self.forced_liquidations = 0
+        self.forced_liq_costs = []
+        self.order_place_times = {}  # order_id -> placed_ts
+        self.order_queue_positions = {}  # order_id -> queue_ahead
+        # Maker-side quantity tracking for realistic fill-rate metric
+        self.maker_qty_placed = 0.0  # qty resting as maker (limit orders accepted)
+        self.maker_qty_filled = 0.0  # qty actually filled as maker
+        
+        # ---------------- New order-completion tracking ----------------
+        # Track unique order IDs that have been accepted by the exchange (placed)
+        self.placed_order_ids: set[str] = set()
+        # Track which of the placed orders ended up fully filled
+        self.filled_order_ids: set[str] = set()
+        self.orders_filled: int = 0
+        self.orders_filled_side = {"buy": 0, "sell": 0}
+
+        self.order_ttl_sec = order_ttl_sec  # None disables TTL
+        self.forced_liq_min_qty = abs(forced_liq_min_qty)
+        self.forced_liq_slip_bps_low = forced_liq_slip_bps_low
+        self.forced_liq_slip_bps_high = forced_liq_slip_bps_high
 
     # ------------------------------------------------------------------
     # Public API
@@ -209,6 +245,20 @@ class BookSimulator:
         still_live: List[Order] = []
         for order in self.active_orders:
             # --------------------------------------------------
+            # TTL check – cancel orders that have been resting too long
+            # --------------------------------------------------
+            if self.order_ttl_sec is not None and (snapshot["ts"] - order.placed_ts) > self.order_ttl_sec:
+                logger.info("Canceling order due to TTL expiry",
+                           order_id=order.order_id,
+                           side=order.side,
+                           price=order.price,
+                           age=snapshot["ts"] - order.placed_ts,
+                           ttl=self.order_ttl_sec,
+                           event=logger.OrderEvent.CANCELED)
+                # Do not add to still_live; treat as cancelled
+                continue
+
+            # --------------------------------------------------
             # 0) Stale-quote risk: if mid has moved such that our
             #    resting quote is now marketable, execute it IMMEDIATELY
             #    against the opposite touch; treat as TAKER.
@@ -243,6 +293,7 @@ class BookSimulator:
 
             # After potential stale-quote fill, skip further processing if filled
             if order.is_filled():
+                self._mark_order_filled(order)
                 continue
 
             # --------------------------------------------------
@@ -279,12 +330,13 @@ class BookSimulator:
                     uncertainty_factor = 1.0 + random.uniform(-self.queue_position_uncertainty, self.queue_position_uncertainty)
                     adjusted_queue_ahead = max(0, order.queue_ahead * uncertainty_factor)
                     
-                    # Calculate fill probability based on queue depth
-                    # Deeper queue = lower probability of being filled
-                    queue_depth_factor = max(0.1, 1.0 - (adjusted_queue_ahead / (order.size * 10)))
-                    fill_probability = min(1.0, queue_depth_factor)
+                    # Calculate fill probability based on traded volume _versus_ our remaining queue depth.
+                    # The larger the traded volume (executed_against_us) relative to the depth in front of us
+                    # plus our own remaining size, the higher the probability of getting hit.
+                    depth_ahead = adjusted_queue_ahead + remaining_qty
+                    fill_probability = min(1.0, executed_against_us / (depth_ahead + 1e-9))
 
-                    # Randomly decide if we get filled based on probability
+                    # Decide if this traded volume actually hits us (probabilistic).
                     if random.random() < fill_probability:
                         # Simulate partial fills
                         if random.random() < self.partial_fill_rate:
@@ -318,26 +370,12 @@ class BookSimulator:
                     else:
                         # Order was skipped - move queue position forward but don't fill
                         order.queue_ahead = max(0, order.queue_ahead - executed_against_us)
-            # If queue ahead depleted, mark full fill via maker path
+            # If queue ahead is depleted we are now at the front of the queue, but we still
+            # need incoming volume to trade against us.  Do NOT automatically fill the rest.
+            # Instead, keep the order live with queue_ahead = 0 and rely on future traded
+            # volume (delta) to gradually execute the remaining quantity.
             if order.queue_ahead <= 0:
-                fill_qty = order.size - order.filled
-                if fill_qty > 0:
-                    best_bid = snapshot["bids"][0][0]
-                    best_ask = snapshot["asks"][0][0]
-                    self._settle_fill(
-                        order.side,
-                        fill_qty,
-                        order.price,
-                        order.placed_ts,
-                        snapshot["ts"],
-                        best_bid,
-                        best_ask,
-                        order.order_id,
-                    )
-                order.filled = order.size
-                # Add to filled orders list for validation
-                if order not in self.filled_orders:
-                    self.filled_orders.append(order)
+                order.queue_ahead = 0
             else:
                 # Optional: cancel if too deep relative to best price
                 best_bid = snapshot["bids"][0][0]
@@ -412,6 +450,8 @@ class BookSimulator:
     def _submit_order(self, side: str, price: float, size: float, snapshot: dict) -> Order:
         """Create order with latency. If latency <= 0, activate immediately."""
         
+        # Counter: count every accepted order (i.e., not rejected after infrastructure / rate-limit checks)
+        
         # Check for maintenance windows and network congestion
         if random.random() < self.maintenance_window_probability:
             logger.warning("Order rejected due to maintenance window", 
@@ -455,6 +495,8 @@ class BookSimulator:
         self.orders_this_second += 1
         self.orders_this_10min += 1
         
+        # We defer metrics increment; will add below when we actually append order or pending list
+        
         # Simulate order rejection (exchange infrastructure issues, invalid orders, etc.)
         if random.random() < self.order_rejection_rate:
             logger.warning("Order rejected by exchange", 
@@ -467,6 +509,12 @@ class BookSimulator:
         if delay < 1e-6:
             # Immediate activation
             order = self._add_order(side, price, size, snapshot)
+            # Metrics increment for accepted order
+            self.orders_placed += 1
+            self.orders_placed_side[side] += 1
+            self.maker_qty_placed += size
+            # Track placed order ID
+            self.placed_order_ids.add(order.order_id)
             logger.info("Order placed and activated immediately", 
                        order_id=order.order_id,
                        side=side,
@@ -485,6 +533,12 @@ class BookSimulator:
             "activate_ts": activate_ts,
             "order_id": order_id,
         })
+        # Metrics increment for accepted (pending) order
+        self.orders_placed += 1
+        self.orders_placed_side[side] += 1
+        self.maker_qty_placed += size
+        # Track placed order ID
+        self.placed_order_ids.add(order_id)
         logger.info("Order placed with latency", 
                    order_id=order_id,
                    side=side,
@@ -539,6 +593,8 @@ class BookSimulator:
                         order_id=order_id,
                     )
                     self.filled_orders.append(synthetic)
+                    # Mark order as fully filled for metrics
+                    self._mark_order_filled(synthetic)
 
                     logger.info(
                         "Latency slippage – order crossed spread and executed as taker",
@@ -575,7 +631,7 @@ class BookSimulator:
         
         # Calculate competing orders that will be placed ahead of us
         competing_size = self._calculate_competing_orders(price, size)
-        
+        self.competition_sizes.append(competing_size)
         # Our queue position = visible size + competing orders
         queue_ahead = visible + competing_size
                 
@@ -591,6 +647,8 @@ class BookSimulator:
             order_id=order_id,
         )
         self.active_orders.append(order)
+        self.order_place_times[order_id] = snapshot["ts"]
+        self.order_queue_positions[order_id] = queue_ahead
         return order
 
     def _settle_fill(
@@ -644,18 +702,39 @@ class BookSimulator:
                         fee=fee,
                         event=logger.PnLEvent.FEE)
         else:
-            # Maker rebate
-            rebate = notional * self.maker_rebate
-            self.cash += rebate
-            self.pnl_components["rebates"] += rebate
-            logger.debug("Maker rebate applied", 
+            # Maker fee or rebate depending on sign
+            fee = notional * self.maker_fee
+            self.cash -= fee  # positive fee reduces cash; negative fee increases cash (rebate)
+            self.pnl_components["fees"] -= fee  # subtract so positive fee -> negative impact
+            logger.debug("Maker fee applied", 
                         order_id=order_id,
-                        rebate=rebate,
-                        event=logger.PnLEvent.REBATE)
+                        fee=fee,
+                        event=logger.PnLEvent.FEE)
             
-            # Note: We removed immediate adverse selection marking
-            # Real market makers hold positions and manage inventory over time
-            # Adverse selection only applies when forced to liquidate
+            # Spread capture (approx – mark price is mid)
+            mid_price = (best_bid + best_ask) / 2.0
+            if order_side == "buy":
+                capture = (mid_price - price) * qty
+            else:
+                capture = (price - mid_price) * qty
+            self.pnl_components["spread_capture"] += capture
+            
+            # Adverse selection: assume mid moves 1–2 ticks against us right after maker fill
+            ticks_move = random.randint(1, 2)
+            adverse_cost = ticks_move * self.tick * qty
+            self.cash -= adverse_cost
+            self.pnl_components["adverse_selection"] -= adverse_cost
+            
+            # Metrics for maker fills
+            self.fills_side[order_side] += 1
+            self.maker_qty_filled += qty
+
+        latency = current_ts - placed_ts
+        self.fill_latencies.append(latency)
+        queue_pos = self.order_queue_positions.get(order_id, 0.0)
+        self.fill_queue_positions.append(queue_pos)
+        lifetime = current_ts - self.order_place_times.get(order_id, current_ts)
+        self.order_lifetimes.append(lifetime)
 
     # ------------------------------------------------------------------
     # Inventory liquidation helper
@@ -665,18 +744,21 @@ class BookSimulator:
         if self.max_inventory <= 0:
             return
 
-        # Liquidate in chunks (at most max_inventory per slice) so we don't move the full
-        # position in one trade – mimics splitting market-orders.
+        did_liq = False
         while abs(self.inventory) > self.max_inventory + 1e-9:
             # Excess amount to bring us back inside the band
             excess = abs(self.inventory) - self.max_inventory
-            qty = min(excess, self.max_inventory)  # chunk size
+            qty = min(excess, max(self.max_inventory, self.forced_liq_min_qty))  # more realistic chunk
 
             side = "sell" if self.inventory > 0 else "buy"
 
             best_bid = snapshot["bids"][0][0]
             best_ask = snapshot["asks"][0][0]
-            price = best_bid if side == "sell" else best_ask
+            n_ticks = random.randint(2, 5)
+            if side == "sell":
+                price = max(0.0, best_bid - n_ticks * self.tick)
+            else:
+                price = best_ask + n_ticks * self.tick
 
             # Unique ID to avoid duplicates in validation
             liq_id = "LIQ" + str(uuid.uuid4())[:6]
@@ -693,12 +775,9 @@ class BookSimulator:
                 order_id=liq_id,
             )
 
-            # Apply adverse selection cost for forced liquidation
-            # This represents the cost of being forced to trade when we don't want to
-            if side == "sell":  # We're selling, so adverse if price goes up
-                adverse_cost = (best_ask - best_bid) * qty * 0.5  # Half spread as adverse selection
-            else:  # We're buying, so adverse if price goes down
-                adverse_cost = (best_ask - best_bid) * qty * 0.5  # Half spread as adverse selection
+            # Use bps-based slippage for cost realism
+            slip_bps = random.uniform(self.forced_liq_slip_bps_low, self.forced_liq_slip_bps_high)
+            adverse_cost = price * slip_bps * qty
             
             self.cash -= adverse_cost
             self.pnl_components["adverse_selection"] -= adverse_cost
@@ -719,6 +798,8 @@ class BookSimulator:
                 order_id=liq_id,
             )
             self.filled_orders.append(synthetic)
+            # Mark order as fully filled for metrics
+            self._mark_order_filled(synthetic)
 
             logger.info(
                 "Forced liquidation executed",
@@ -728,6 +809,13 @@ class BookSimulator:
                 remaining_inventory=self.inventory,
                 event=logger.OrderEvent.FORCED_LIQ,
             )
+
+            self.forced_liq_costs.append(adverse_cost)
+            did_liq = True
+
+        # Count one liquidation event per snapshot regardless of chunking
+        if did_liq:
+            self.forced_liquidations += 1
 
     # ------------------------------------------------------------------
     # Metrics
@@ -756,9 +844,9 @@ class BookSimulator:
         This models other market makers competing for the same opportunities.
         Competition intensity varies based on market conditions and our order size.
         """
-        # Base number of competitors based on competition intensity
+        # Base number of competitors based on competition intensity (scaled up for realism)
         base_competitors = self.min_competitors + int(
-            (self.max_competitors - self.min_competitors) * self.competition_intensity
+            (self.max_competitors - self.min_competitors) * self.competition_intensity * 1.5
         )
         
         # Add some randomness to make it more realistic
@@ -767,13 +855,12 @@ class BookSimulator:
             min(self.max_competitors, base_competitors + 1)
         )
         
-        # Calculate total competing order size
-        # Larger orders attract more competition
-        size_multiplier = 1.0 + (our_order_size / self.competitor_order_size) * 0.5
+        # Calculate total competing order size (increase multiplier for tougher fills)
+        size_multiplier = 1.0 + (our_order_size / self.competitor_order_size) * 1.0
         competing_size = num_competitors * self.competitor_order_size * size_multiplier
         
-        # Add some randomness to competing order sizes
-        competing_size *= random.uniform(0.8, 1.2)
+        # Add heavier-tailed randomness to competing order sizes
+        competing_size *= random.uniform(1.0, 2.0)  # 1-2× for more variance
         
         logger.debug("Competing orders calculated", 
                     price_level=price_level,
@@ -795,18 +882,62 @@ class BookSimulator:
             # Calculate funding rate based on current inventory position
             funding_rate = random.gauss(self.funding_rate_mean, self.funding_rate_std)
             
-            # Apply funding rate to inventory (simplified calculation)
-            funding_cost = self.inventory * funding_rate
-            self.inventory += funding_cost
-            
-            # Track funding cost in P&L
-            self.pnl_components["funding_rates"] -= abs(funding_cost)
+            # Funding is paid/received based on notional position value.
+            # Use mid-price from last snapshot to convert BTC to USDT.
+            if self.last_snapshot is None:
+                return  # can't apply funding without price context
+
+            mid_price = self.last_snapshot.get("mid")
+            # Notional USDT value of position
+            notional = self.inventory * mid_price
+
+            funding_cost = notional * funding_rate  # positive = cost (we pay), negative = credit
+
+            # Apply funding to cash (inventory unchanged)
+            self.cash -= funding_cost
+
+            # Track in P&L with correct sign
+            self.pnl_components["funding_rates"] -= funding_cost  # cost positive, rebate negative
             
             # Update last funding timestamp
             self.last_funding_ts = current_ts
             
             logger.debug("Funding rates applied", 
                         funding_rate=funding_rate,
+                        notional=notional,
                         funding_cost=funding_cost,
-                        new_inventory=self.inventory,
+                        new_cash=self.cash,
                         event=logger.PnLEvent.FUNDING_RATE)
+
+    def get_additional_metrics(self) -> Dict[str, float]:
+        metrics = {}
+        metrics["orders_placed"] = self.orders_placed
+        metrics["orders_placed_buy"] = self.orders_placed_side["buy"]
+        metrics["orders_placed_sell"] = self.orders_placed_side["sell"]
+        metrics["orders_filled"] = self.orders_filled
+        metrics["orders_filled_buy"] = self.orders_filled_side["buy"]
+        metrics["orders_filled_sell"] = self.orders_filled_side["sell"]
+        metrics["order_fill_rate"] = self.orders_filled / self.orders_placed if self.orders_placed else 0.0
+        metrics["maker_qty_placed"] = self.maker_qty_placed
+        metrics["maker_qty_filled"] = self.maker_qty_filled
+        metrics["maker_fill_qty_rate"] = self.maker_qty_filled / self.maker_qty_placed if self.maker_qty_placed else 0.0
+        metrics["avg_fill_latency_sec"] = float(np.mean(self.fill_latencies)) if self.fill_latencies else 0.0
+        metrics["std_fill_latency_sec"] = float(np.std(self.fill_latencies)) if self.fill_latencies else 0.0
+        metrics["avg_queue_position"] = float(np.mean(self.fill_queue_positions)) if self.fill_queue_positions else 0.0
+        metrics["std_queue_position"] = float(np.std(self.fill_queue_positions)) if self.fill_queue_positions else 0.0
+        metrics["avg_order_lifetime_sec"] = float(np.mean(self.order_lifetimes)) if self.order_lifetimes else 0.0
+        metrics["std_order_lifetime_sec"] = float(np.std(self.order_lifetimes)) if self.order_lifetimes else 0.0
+        metrics["avg_competition_size"] = float(np.mean(self.competition_sizes)) if self.competition_sizes else 0.0
+        metrics["std_competition_size"] = float(np.std(self.competition_sizes)) if self.competition_sizes else 0.0
+        metrics["forced_liquidations"] = self.forced_liquidations
+        metrics["avg_forced_liq_cost"] = float(np.mean(self.forced_liq_costs)) if self.forced_liq_costs else 0.0
+        metrics["std_forced_liq_cost"] = float(np.std(self.forced_liq_costs)) if self.forced_liq_costs else 0.0
+
+        return metrics
+
+    def _mark_order_filled(self, order: Order):
+        """Helper to mark an order as completely filled exactly once."""
+        if order.order_id in self.placed_order_ids and order.order_id not in self.filled_order_ids:
+            self.filled_order_ids.add(order.order_id)
+            self.orders_filled += 1
+            self.orders_filled_side[order.side] += 1

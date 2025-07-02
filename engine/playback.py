@@ -109,8 +109,8 @@ def main():
     parser.add_argument("--hold_time", type=float, default=0.5, help="Minimum time (seconds) a quote must rest before it can be replaced")
     parser.add_argument("--latency_mean_ms", type=float, default=100.0, help="Mean network/order latency in milliseconds")
     parser.add_argument("--latency_std_ms", type=float, default=30.0, help="Std dev of latency in ms")
-    parser.add_argument("--maker_rebate", type=float, default=0.0002, help="Maker rebate rate (e.g., 0.0002 for 2 bps)")
-    parser.add_argument("--taker_fee", type=float, default=0.0004, help="Taker fee rate (e.g., 0.0004 for 4 bps)")
+    parser.add_argument("--maker_fee", type=float, default=0.0002, help="Maker fee rate (positive cost, negative rebate)")
+    parser.add_argument("--taker_fee", type=float, default=0.0005, help="Taker fee rate (e.g., 0.0005 for 5 bps)")
     parser.add_argument("--max_inventory", type=float, default=0.01, help="Absolute BTC inventory threshold before forced taker liquidation")
     parser.add_argument("--capital_base", type=float, default=10000.0, help="Nominal capital (USDT) to normalise P&L for return calculations")
     parser.add_argument("--sharpe_horizon", type=float, default=60.0, help="Seconds per return bucket for Sharpe ratio (e.g., 60 = 1-minute Sharpe)")
@@ -122,11 +122,13 @@ def main():
     parser.add_argument("--max_snapshots", type=int, default=0, help="Maximum number of snapshots to process (0 = no limit)")
     parser.add_argument("--log_throttle", type=int, default=0, help="Only log every N snapshots to reduce verbosity (0 = log all snapshots)")
     parser.add_argument("--print_interval", type=int, default=5000, help="Print summary every N snapshots (quant-friendly output)")
+    parser.add_argument("--order_ttl", type=float, default=0.8, help="Maximum lifetime in seconds for a resting quote before cancel (0 = disabled)")
     # Competition parameters
-    parser.add_argument("--competition_intensity", type=float, default=0.5, help="Competition intensity (0.0 = none, 1.0 = high)")
-    parser.add_argument("--min_competitors", type=int, default=1, help="Minimum competing orders per price level")
-    parser.add_argument("--max_competitors", type=int, default=5, help="Maximum competing orders per price level")
+    parser.add_argument("--competition_intensity", type=float, default=0.9, help="Competition intensity (0.0 = none, 1.0 = high)")
+    parser.add_argument("--min_competitors", type=int, default=3, help="Minimum competing orders per price level")
+    parser.add_argument("--max_competitors", type=int, default=8, help="Maximum competing orders per price level")
     parser.add_argument("--competitor_order_size", type=float, default=0.05, help="Average size of competing orders (BTC)")
+    parser.add_argument("--funding_interval", type=float, default=8.0, help="Funding interval in hours (default 8). Use smaller for short simulations")
     args = parser.parse_args()
     
     # Set up logging
@@ -178,7 +180,7 @@ def main():
 
     book = BookSimulator(
         tick_size=tick,
-        maker_rebate=args.maker_rebate,
+        maker_fee=args.maker_fee,
         taker_fee=args.taker_fee,
         latency_mean_ms=args.latency_mean_ms,
         latency_std_ms=args.latency_std_ms,
@@ -186,6 +188,12 @@ def main():
         min_competitors=args.min_competitors,
         max_competitors=args.max_competitors,
         competitor_order_size=args.competitor_order_size,
+        competition_intensity=args.competition_intensity,
+        capital_base=args.capital_base,
+        order_ttl_sec=args.order_ttl if args.order_ttl > 0 else None,
+        # Funding parameters
+        # Convert hours to seconds so we can tweak in short backtests
+        funding_interval_sec=int(args.funding_interval * 3600),
     )
 
     prev_ts: float | None = None
@@ -255,8 +263,9 @@ def main():
                 logger.error("Strategy error", error=str(e))
 
         # Mark-to-market after update; record each snapshot for accurate stats
-        pnl_current = book.mark_to_market(mid)
-        pnl_series.append(pnl_current)
+        portfolio_value = book.mark_to_market(mid)
+        pnl_current = portfolio_value - args.capital_base  # Calculate actual P&L
+        pnl_series.append(portfolio_value)  # Store absolute portfolio value for drawdown
         inv_series.append(book.inventory)
         ts_series.append(ts)
         
@@ -266,7 +275,8 @@ def main():
             "ts": ts,
             "mid": mid,
             "inventory": book.inventory,
-            "pnl": pnl_current,
+            "pnl": pnl_current,  # Store actual P&L
+            "portfolio_value": portfolio_value,  # Store absolute value
             "active_orders": len(book.active_orders),
             "fill_count": book.fills_count
         })
@@ -299,25 +309,28 @@ def main():
             logger.info("Computing performance metrics...")
             
             # Calculate total P&L and final inventory
-            final_pnl = pnl_series[-1] if pnl_series else 0.0
+            final_portfolio_value = pnl_series[-1] if pnl_series else args.capital_base
+            final_pnl = final_portfolio_value - args.capital_base  # Calculate actual P&L
             final_inv = inv_series[-1] if inv_series else 0.0
             
+            logger.info(f"Final portfolio value: {final_portfolio_value:.4f} USDT")
             logger.info(f"Final P&L: {final_pnl:.4f} USDT")
             logger.info(f"Final inventory: {final_inv:.6f} BTC")
             logger.info(f"Total fills: {book.fills_count}")
         
-            # Calculate max drawdown - start from initial capital, not 0
+            # Calculate max drawdown - now working with absolute portfolio values
             max_drawdown = 0.0
-            peak = args.capital_base  # Start from initial capital, not 0
+            peak = args.capital_base  # Start from initial capital
             for pnl in pnl_series:
-                current_value = args.capital_base + pnl  # Add P&L to initial capital
+                # pnl is now absolute portfolio value (cash + inventory * mid_price)
+                current_value = pnl  # No need to add capital_base again
                 if current_value > peak:
                     peak = current_value
                 drawdown = peak - current_value
                 if drawdown > max_drawdown:
                     max_drawdown = drawdown
             
-            logger.info(f"Maximum drawdown: {max_drawdown:.4f} USDT ({max_drawdown/args.capital_base*100:.2f}% of capital)")
+            logger.info(f"Maximum drawdown: {max_drawdown:.4f} USDT ({max_drawdown/args.capital_base*100:.4f}% of capital)")
         
         # ------------------ Sharpe Ratio ------------------
         # 1. Aggregate P&L into fixed-length buckets (args.sharpe_horizon sec)
@@ -369,12 +382,14 @@ def main():
             metrics_file = os.path.join(args.output_dir, f"{args.strategy}_metrics.json")
             
             # Create metrics dictionary with all calculated values
+            additional_metrics = book.get_additional_metrics()
             metrics_dict = {
                 "final_pnl": final_pnl,
                 "final_inventory": final_inv,
                 "fill_count": book.fills_count,
                 "max_drawdown": max_drawdown,
                 "pnl_attribution": pnl_attribution,
+                "additional_metrics": additional_metrics,
                 "strategy": args.strategy,
                 "strategy_kwargs": kw,
                 "snapshots_processed": len(pnl_series)
@@ -393,6 +408,12 @@ def main():
             # Save detailed log if requested
             if args.log_file:
                 logger.info(f"Detailed log saved to {args.log_file}")
+
+        # Print additional metrics for fill rate, latency, queue, etc.
+        additional_metrics = book.get_additional_metrics()
+        logger.info("--- Additional Model Metrics ---")
+        for k, v in additional_metrics.items():
+            logger.info(f"{k}: {v}")
 
 
 if __name__ == "__main__":
