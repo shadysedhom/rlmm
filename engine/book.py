@@ -37,7 +37,8 @@ class BookSimulator:
         tick_size: float,
         cancel_if_behind: bool = True,
         max_ticks_away: int = 3,
-        maker_fee: float = 0.0002,  # 0.02% maker fee for regular users (positive = cost, negative = rebate)
+        maker_fee: float = 0.0002,  # 0.02% maker fee for regular users (positive cost, negative rebate)
+        maker_rebate: float | None = None,  # deprecated alias (negative maker_fee)
         taker_fee: float = 0.0005,     # 0.05% taker fee for regular users
         latency_mean_ms: float = 20.0,
         latency_std_ms: float = 5.0,
@@ -67,7 +68,11 @@ class BookSimulator:
         self.tick = tick_size
         self.cancel_if_behind = cancel_if_behind
         self.max_ticks_away = max_ticks_away
-        self.maker_fee = maker_fee  # positive cost, negative rebate
+        # Backward-compat: legacy unit tests pass maker_rebate parameter (positive = rebate)
+        if maker_rebate is not None:
+            self.maker_fee = -abs(maker_rebate)  # treat as rebate (negative fee)
+        else:
+            self.maker_fee = maker_fee
         self.taker_fee = taker_fee
         self.lat_mean = latency_mean_ms / 1000.0
         self.lat_std = latency_std_ms / 1000.0
@@ -95,7 +100,7 @@ class BookSimulator:
         
         # Dynamic competition intensity (set in update)
         self.competition_intensity = max(0.0, min(competition_intensity, 1.0))
-        
+
         self.active_orders: List[Order] = []
         self.filled_orders: List[Order] = []  # Keep track of filled orders for validation
         self.inventory: float = 0.0
@@ -164,6 +169,9 @@ class BookSimulator:
         self.forced_liq_min_qty = abs(forced_liq_min_qty)
         self.forced_liq_slip_bps_low = forced_liq_slip_bps_low
         self.forced_liq_slip_bps_high = forced_liq_slip_bps_high
+
+        # Track previous mid price for inventory move attribution
+        self._last_mid_price: float | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -244,14 +252,17 @@ class BookSimulator:
 
         still_live: List[Order] = []
         for order in self.active_orders:
+            # Pre-compute current best price references for this snapshot
+            best_bid = snapshot["bids"][0][0]
+            best_ask = snapshot["asks"][0][0]
             # --------------------------------------------------
             # TTL check – cancel orders that have been resting too long
             # --------------------------------------------------
             if self.order_ttl_sec is not None and (snapshot["ts"] - order.placed_ts) > self.order_ttl_sec:
                 logger.info("Canceling order due to TTL expiry",
-                           order_id=order.order_id,
-                           side=order.side,
-                           price=order.price,
+                            order_id=order.order_id,
+                            side=order.side,
+                            price=order.price,
                            age=snapshot["ts"] - order.placed_ts,
                            ttl=self.order_ttl_sec,
                            event=logger.OrderEvent.CANCELED)
@@ -263,9 +274,6 @@ class BookSimulator:
             #    resting quote is now marketable, execute it IMMEDIATELY
             #    against the opposite touch; treat as TAKER.
             # --------------------------------------------------
-            best_bid = snapshot["bids"][0][0]
-            best_ask = snapshot["asks"][0][0]
-
             crossed = (
                 (order.side == "buy" and order.price >= best_ask - 1e-9) or
                 (order.side == "sell" and order.price <= best_bid + 1e-9)
@@ -288,8 +296,8 @@ class BookSimulator:
                     order.filled = order.size  # fully filled
 
                     # Record in filled orders list for accounting consistency
-                    if order not in self.filled_orders:
-                        self.filled_orders.append(order)
+                if order not in self.filled_orders:
+                    self.filled_orders.append(order)
 
             # After potential stale-quote fill, skip further processing if filled
             if order.is_filled():
@@ -378,8 +386,6 @@ class BookSimulator:
                 order.queue_ahead = 0
             else:
                 # Optional: cancel if too deep relative to best price
-                best_bid = snapshot["bids"][0][0]
-                best_ask = snapshot["asks"][0][0]
                 if self.cancel_if_behind:
                     drift_ticks = (
                         (best_bid - order.price) / self.tick
@@ -609,11 +615,11 @@ class BookSimulator:
                     order = self._add_order(side, price, size, snapshot, order_id)
                     logger.info(
                         "Pending order activated",
-                        order_id=order.order_id,
-                        side=order.side,
-                        price=order.price,
-                        size=order.size,
-                        queue_ahead=order.queue_ahead,
+                           order_id=order.order_id,
+                           side=order.side,
+                           price=order.price,
+                           size=order.size,
+                           queue_ahead=order.queue_ahead,
                         event=logger.OrderEvent.ACTIVATED,
                     )
             else:
@@ -822,13 +828,24 @@ class BookSimulator:
     # ------------------------------------------------------------------
     def mark_to_market(self, mid_price: float) -> float:
         """Calculate mark-to-market P&L and update inventory value component."""
+        # Increment inventory PnL only for price moves on existing inventory
+        if self._last_mid_price is not None:
+            inv_move = self.inventory * (mid_price - self._last_mid_price)
+            if inv_move != 0:
+                self.pnl_components["inventory_moves"] += inv_move
+
+        # Update tracker
+        self._last_mid_price = mid_price
+
         mtm = self.cash + self.inventory * mid_price
-        logger.debug("Mark-to-market update", 
-                    cash=self.cash,
-                    inventory=self.inventory,
-                    mid_price=mid_price,
-                    mtm_value=mtm,
-                    event=logger.PnLEvent.MARK_TO_MARKET)
+        logger.debug(
+            "Mark-to-market update",
+            cash=self.cash,
+            inventory=self.inventory,
+            mid_price=mid_price,
+            mtm_value=mtm,
+            event=logger.PnLEvent.MARK_TO_MARKET,
+        )
         return mtm
         
     def get_pnl_attribution(self) -> Dict[str, float]:
@@ -917,7 +934,9 @@ class BookSimulator:
         metrics["orders_filled"] = self.orders_filled
         metrics["orders_filled_buy"] = self.orders_filled_side["buy"]
         metrics["orders_filled_sell"] = self.orders_filled_side["sell"]
-        metrics["order_fill_rate"] = self.orders_filled / self.orders_placed if self.orders_placed else 0.0
+        metrics["order_fill_rate_qty"] = (
+            self.maker_qty_filled / self.maker_qty_placed if self.maker_qty_placed else 0.0
+        )
         metrics["maker_qty_placed"] = self.maker_qty_placed
         metrics["maker_qty_filled"] = self.maker_qty_filled
         metrics["maker_fill_qty_rate"] = self.maker_qty_filled / self.maker_qty_placed if self.maker_qty_placed else 0.0
@@ -941,3 +960,21 @@ class BookSimulator:
             self.filled_order_ids.add(order.order_id)
             self.orders_filled += 1
             self.orders_filled_side[order.side] += 1
+
+    def time_to_next_funding(self, current_ts: float) -> float:
+        """Return seconds until the next scheduled funding event.
+
+        If funding is disabled (interval <= 0) we return +inf so callers can safely ignore it.
+        """
+        if self.funding_interval <= 0:
+            return float("inf")
+
+        # If we have not observed a funding event yet, align to the nearest future multiple
+        if self.last_funding_ts is None:
+            next_ts = (current_ts // self.funding_interval) * self.funding_interval + self.funding_interval
+        else:
+            # How many full intervals have elapsed since the last funding timestamp?
+            periods_ahead = int((current_ts - self.last_funding_ts) // self.funding_interval) + 1
+            next_ts = self.last_funding_ts + periods_ahead * self.funding_interval
+
+        return next_ts - current_ts

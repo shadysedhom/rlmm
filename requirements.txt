@@ -9,5 +9,6 @@ aiohttp # for downloading data
 requests # for downloading data
 tqdm # for progress bars
 kagglehub # for downloading data
+pyyaml>=6.0
 
 

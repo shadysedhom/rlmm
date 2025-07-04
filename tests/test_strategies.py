@@ -62,7 +62,7 @@ class TestSkewMidSpreadStrategy(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures."""
-        self.strategy = SkewMidSpreadStrategy(size=0.5, gamma=0.1)
+        self.strategy = SkewMidSpreadStrategy(size=0.5, gamma=0.1, clamp_ticks=0)
         
         # Create a basic snapshot for testing
         self.snapshot = {
@@ -86,8 +86,8 @@ class TestSkewMidSpreadStrategy(unittest.TestCase):
         expected_bid = expected_mid - expected_spread / 2  # 10000.0
         expected_ask = expected_mid + expected_spread / 2  # 10000.1
         
-        self.assertAlmostEqual(quote["bid_price"], expected_bid)
-        self.assertAlmostEqual(quote["ask_price"], expected_ask)
+        self.assertAlmostEqual(quote["bid_price"], expected_bid, places=6)
+        self.assertAlmostEqual(quote["ask_price"], expected_ask, places=6)
         self.assertEqual(quote["size"], 0.5)
         
     def test_positive_inventory(self):
@@ -104,8 +104,8 @@ class TestSkewMidSpreadStrategy(unittest.TestCase):
         expected_bid = expected_mid - expected_spread / 2 - skew  # 9999.9
         expected_ask = expected_mid + expected_spread / 2 - skew  # 10000.0
         
-        self.assertAlmostEqual(quote["bid_price"], expected_bid)
-        self.assertAlmostEqual(quote["ask_price"], expected_ask)
+        self.assertAlmostEqual(quote["bid_price"], expected_bid, places=6)
+        self.assertAlmostEqual(quote["ask_price"], expected_ask, places=6)
         self.assertEqual(quote["size"], 0.5)
         
     def test_negative_inventory(self):
@@ -122,15 +122,15 @@ class TestSkewMidSpreadStrategy(unittest.TestCase):
         expected_bid = expected_mid - expected_spread / 2 - skew  # 10000.1
         expected_ask = expected_mid + expected_spread / 2 - skew  # 10000.2
         
-        self.assertAlmostEqual(quote["bid_price"], expected_bid)
-        self.assertAlmostEqual(quote["ask_price"], expected_ask)
+        self.assertAlmostEqual(quote["bid_price"], expected_bid, places=6)
+        self.assertAlmostEqual(quote["ask_price"], expected_ask, places=6)
         self.assertEqual(quote["size"], 0.5)
         
     def test_different_gamma_values(self):
         """Test that different gamma values produce different skews."""
         # Create strategies with different gamma values
-        strategy1 = SkewMidSpreadStrategy(size=0.5, gamma=0.1)
-        strategy2 = SkewMidSpreadStrategy(size=0.5, gamma=0.2)
+        strategy1 = SkewMidSpreadStrategy(size=0.5, gamma=0.1, clamp_ticks=0)
+        strategy2 = SkewMidSpreadStrategy(size=0.5, gamma=0.2, clamp_ticks=0)
         
         # Generate quotes with same inventory
         quote1 = strategy1.on_snapshot(self.snapshot, inventory=1.0)

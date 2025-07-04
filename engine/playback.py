@@ -54,7 +54,15 @@ class SnapshotLoader:
             logger.info(f"Processing file", file=fp.name)
             with gzip.open(fp, "rt") as gz:
                 for line in gz:
-                    yield json.loads(line)
+                    snap = json.loads(line)
+                    # Attach DepthLadder helper for richer analytics (non-breaking addition)
+                    try:
+                        from engine.depth import DepthLadder  # local import to avoid cycle if depth imports playback
+                        snap["depth"] = DepthLadder(bids=snap["bids"], asks=snap["asks"], ts=snap["ts"])
+                    except Exception as _e:
+                        # Fallback gracefully if structure mismatched
+                        pass
+                    yield snap
 
 
 def load_strategy(name: str):
@@ -233,6 +241,13 @@ def main():
         ts = snap["ts"]
         mid = (snap["bids"][0][0] + snap["asks"][0][0]) / 2.0
         snap["mid"] = mid  # inject mid for adverse-selection logic
+
+        # ---------------- Funding countdown ----------------
+        try:
+            snap["t_to_funding"] = book.time_to_next_funding(ts)
+        except AttributeError:
+            # Backward-compat: older BookSimulator without this helper
+            pass
 
         # Optional real-time throttling
         if args.speed > 0 and prev_ts is not None:

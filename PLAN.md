@@ -4,4 +4,5 @@ Phase 2 Build a simple playback (simulation) engine
 Phase 3 Add performance metrics (Sharpe, max drawdown, etc.)
 Phase 4 Implement & test a baseline quoting strategy (no ML yet)
 Phase 5 Plug in an RL agent (Stable-Baselines3 PPO)
-Phase 6 Visualize the results & write a report to reflect
+Phade 6 Refactor code for simplicity, readability, and code quality
+Phase 7 Visualize the results & write a report to reflect

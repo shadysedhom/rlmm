@@ -9,7 +9,14 @@ import argparse
 import subprocess
 import os
 import sys
+import json
 from pathlib import Path
+
+# Optional YAML support
+try:
+    import yaml  # type: ignore
+except ImportError:  # Fallback when PyYAML not installed
+    yaml = None
 
 def main():
     parser = argparse.ArgumentParser(description="Run market-making simulator with appropriate parameters")
@@ -22,9 +29,19 @@ def main():
     parser.add_argument("--log_file", help="Path to log file (optional)")
     parser.add_argument("--json_logs", action="store_true", help="Output logs in JSON format")
     parser.add_argument("--strategy_kwargs", default="", help="Strategy parameters (e.g. 'gamma=0.1,size=0.001')")
+    parser.add_argument("--config", help="Path to YAML or JSON config file with parameters")
     parser.add_argument("--data_dir", default="data/converted/binance", help="Directory containing order book data")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output (sets log_throttle=0)")
     parser.add_argument("--quiet", action="store_true", help="Run silently and only show the final summary")
+    parser.add_argument("--order_ttl", type=float, default=0.8, help="Maximum lifetime of a resting quote in seconds (0 to disable)")
+    parser.add_argument("--max_inventory", type=float, default=0.01, help="Absolute BTC inventory limit before forced liquidation")
+    parser.add_argument("--latency_mean_ms", type=float, default=100.0, help="Mean network/order latency in milliseconds")
+    parser.add_argument("--latency_std_ms", type=float, default=30.0, help="Std-dev of latency in milliseconds")
+    parser.add_argument("--competition_intensity", type=float, default=0.9, help="Queue competition intensity (0 none, 1 high)")
+    parser.add_argument("--min_competitors", type=int, default=3, help="Minimum competing orders per price level")
+    parser.add_argument("--max_competitors", type=int, default=8, help="Maximum competing orders per price level")
+    parser.add_argument("--competitor_order_size", type=float, default=0.05, help="Average size (BTC) of competing orders")
+    parser.add_argument("--funding_interval", type=float, default=8.0, help="Funding interval in hours (perpetual futures)")
     args = parser.parse_args()
     
     # Create output directory if it doesn't exist
@@ -46,6 +63,45 @@ def main():
         original_stdout = sys.stdout
         null_output = open(os.devnull, 'w')
         sys.stdout = null_output
+    
+    # ------------------------------------------------------------------
+    # Config file overrides (highest precedence: CLI > config > defaults)
+    # ------------------------------------------------------------------
+    if args.config:
+        cfg_path = Path(args.config)
+        if not cfg_path.exists():
+            print(f"Config file {cfg_path} not found", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            if cfg_path.suffix.lower() == ".json":
+                with cfg_path.open() as f:
+                    cfg_dict = json.load(f)
+            else:
+                if yaml is None:
+                    raise ImportError("PyYAML is required for YAML config files. Install with 'pip install pyyaml'.")
+                with cfg_path.open() as f:
+                    cfg_dict = yaml.safe_load(f)
+            if not isinstance(cfg_dict, dict):
+                raise ValueError("Config root must be a mapping/dictionary")
+        except Exception as e:
+            print(f"Failed to load config: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        # Apply config values to args if they are not set via CLI
+        for key, val in cfg_dict.items():
+            if hasattr(args, key):
+                current = getattr(args, key)
+                # Skip if CLI already provided a non-default value (argparse sets defaults beforehand)
+                # We approximate by checking if the CLI string is not the parser default
+                if isinstance(current, str) and current != parser.get_default(key):
+                    continue
+                setattr(args, key, val)
+
+        # Handle strategy_kwargs if provided as dict in config
+        if isinstance(args.strategy_kwargs, dict):
+            # Convert to comma-separated k=v string expected downstream
+            args.strategy_kwargs = ",".join(f"{k}={v}" for k, v in args.strategy_kwargs.items())
     
     # Build command to run playback.py
     cmd = [
@@ -69,6 +125,17 @@ def main():
     if args.strategy_kwargs:
         cmd.extend(["--strategy_kwargs", args.strategy_kwargs])
     
+    # Forward playback parameters
+    cmd.extend(["--order_ttl", str(args.order_ttl)])
+    cmd.extend(["--max_inventory", str(args.max_inventory)])
+    cmd.extend(["--latency_mean_ms", str(args.latency_mean_ms)])
+    cmd.extend(["--latency_std_ms", str(args.latency_std_ms)])
+    cmd.extend(["--competition_intensity", str(args.competition_intensity)])
+    cmd.extend(["--min_competitors", str(args.min_competitors)])
+    cmd.extend(["--max_competitors", str(args.max_competitors)])
+    cmd.extend(["--competitor_order_size", str(args.competitor_order_size)])
+    cmd.extend(["--funding_interval", str(args.funding_interval)])
+    
     # Print command for reference (unless in quiet mode)
     if not args.quiet:
         print(f"Running command: {' '.join(cmd)}")
@@ -89,7 +156,6 @@ def main():
     metrics_file = os.path.join(args.output_dir, f"{args.strategy}_metrics.json")
     if os.path.exists(metrics_file):
         try:
-            import json
             with open(metrics_file, 'r') as f:
                 metrics = json.load(f)
                 
@@ -103,6 +169,19 @@ def main():
                 print("\nP&L Attribution:")
                 for component, value in metrics['pnl_attribution'].items():
                     print(f"  {component}: {value:.4f} USDT")
+
+            # Print Sharpe ratio if calculated
+            if 'sharpe_ratio' in metrics:
+                print(f"\nSharpe Ratio: {metrics['sharpe_ratio']:.4f} (window {metrics.get('sharpe_horizon_seconds', '?')}s)")
+
+            # Print additional model metrics if available
+            if 'additional_metrics' in metrics:
+                print("\nAdditional Model Metrics:")
+                for k, v in metrics['additional_metrics'].items():
+                    if isinstance(v, float):
+                        print(f"  {k}: {v:.4f}")
+                    else:
+                        print(f"  {k}: {v}")
         except Exception as e:
             print(f"Could not read metrics file: {e}")
 

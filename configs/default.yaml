@@ -1,0 +1,34 @@
+# Example configuration for run_simulator.py
+# You can copy this file and modify values as needed, then call:
+#   py run_simulator.py --config configs/my_preset.yaml
+
+strategy: skew_mid_spread
+max_snapshots: 5000
+log_level: INFO
+log_throttle: 10
+print_interval: 5000
+
+# Playback / engine parameters
+order_ttl: 0.4      # seconds
+# Started w/ Inter-continental retail route (Amsterdam -> Binance Singapore) at 135ms mean latency, which is heavy on performance
+latency_mean_ms: 15 # High latency cloud, improves performance
+latency_std_ms: 5
+max_inventory: 0.1 # in BTC
+competition_intensity: 0.9 # 0=no competition, 1=high competition
+min_competitors: 3 # Minimum competing orders per price level (tougher)
+max_competitors: 8 # Maximum competing orders per price level (tougher)
+competitor_order_size: 0.05 # in BTC
+funding_interval: 8.0 # Once every 8 hours for perpetual futures
+
+# Strategy parameters (dict will be converted to k=v string automatically)
+strategy_kwargs:
+  k_vol: 1.0
+  gamma: 0.1
+  gradient_threshold: 1.5
+  gradient_penalty_ticks: 1
+
+# Data directory (relative to project root)
+data_dir: data/converted/binance
+
+# Output directory
+output_dir: ./results 
