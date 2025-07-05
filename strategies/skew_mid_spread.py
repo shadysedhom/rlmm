@@ -25,19 +25,30 @@ import numpy as np
 class Strategy:  # pylint: disable=too-few-public-methods
     def __init__(
         self,
-        size: float = 0.1,
+        size: float | None = None,
+        size_base: float | None = None,
         gamma: float = 0.1,
         max_inventory: float = 100.0,
         use_ticks: bool = False,
         clamp_ticks: int = 2,
         gamma_imb: float = 0.0,
-        # --- new volatility-adaptive params ---
+        # --- volatility-adaptive spread params ---
         k_vol: float = 1.0,
         vol_window: int = 20,
         # --- depth-gradient params ---
         gradient_threshold: float = 1.5,
         gradient_penalty_ticks: int = 1,
         gradient_size_factor: float = 0.7,
+        # --- adaptive gamma params ---
+        gamma_inv_scale: float = 1.0,   # α: how strongly gamma scales with |inventory| / max_inventory
+        gamma_vol_scale: float = 1.0,   # β: how strongly gamma scales with realised vol / vol_ref
+        gamma_cap_factor: float = 3.0,  # cap: γ_dynamic ≤ γ_base * cap_factor
+        vol_ref: float | None = None,   # reference vol; if None will be estimated on first window
+        # --- dynamic sizing params ---
+        size_min_factor: float = 0.2,   # lower bound fraction of base_size
+        size_exp: float = 1.0,          # exponent for non-linear sizing (1 = linear)
+        # --- fixed spread padding ---
+        extra_spread_ticks: int = 0,    # add N ticks to half-spread regardless of volatility
     ):
         """Create a skewed mid-spread strategy.
 
@@ -55,8 +66,20 @@ class Strategy:  # pylint: disable=too-few-public-methods
             gradient_threshold: Threshold for depth gradient adjustment
             gradient_penalty_ticks: Penalty for depth gradient adjustment
             gradient_size_factor: Size factor for depth gradient adjustment
+            gamma_inv_scale: α: how strongly gamma scales with |inventory| / max_inventory
+            gamma_vol_scale: β: how strongly gamma scales with realised vol / vol_ref
+            gamma_cap_factor: cap: γ_dynamic ≤ γ_base * cap_factor
+            vol_ref: reference vol; if None will be estimated on first window
+            size_min_factor: lower bound fraction of base_size
+            size_exp: exponent for non-linear sizing (1 = linear)
+            extra_spread_ticks: fixed number of ticks added to half-spread
         """
-        self.base_size = size  # keep original for reference
+        if size is not None:
+            self.base_size = size
+        elif size_base is not None:
+            self.base_size = size_base
+        else:
+            self.base_size = 0.1
         self.gamma = gamma
         self.max_inventory = max_inventory
         self.use_ticks = use_ticks
@@ -69,6 +92,19 @@ class Strategy:  # pylint: disable=too-few-public-methods
         self.gradient_threshold = gradient_threshold
         self.gradient_penalty_ticks = gradient_penalty_ticks
         self.gradient_size_factor = gradient_size_factor
+
+        # adaptive gamma parameters
+        self.gamma_inv_scale = gamma_inv_scale
+        self.gamma_vol_scale = gamma_vol_scale
+        self.gamma_cap_factor = max(1.0, gamma_cap_factor)
+        self.vol_ref = vol_ref  # set later if None
+
+        # sizing params
+        self.size_min_factor = max(0.0, min(size_min_factor, 1.0))
+        self.size_exp = max(0.1, size_exp)
+
+        # fixed spread padding
+        self.extra_spread_ticks = max(0, int(extra_spread_ticks))
 
         # rolling window of recent micro-prices for realised vol calc
         self._price_window: deque[float] = deque(maxlen=self.vol_window)
@@ -98,8 +134,12 @@ class Strategy:  # pylint: disable=too-few-public-methods
         else:
             tick = 0.01
 
-        # Position sizing depending on inventory magnitude (base before gradient adjustments)
-        inventory_factor = max(0.1, 1.0 - abs(inventory) / self.max_inventory)
+        # -------- Dynamic position sizing --------
+        inv_ratio = min(1.0, abs(inventory) / self.max_inventory)
+        inventory_factor = max(
+            self.size_min_factor,
+            (1.0 - inv_ratio) ** self.size_exp,
+        )
         adjusted_size = self.base_size * inventory_factor
 
         # ------------- Fair value & volatility -------------
@@ -115,13 +155,31 @@ class Strategy:  # pylint: disable=too-few-public-methods
         else:
             vol = tick  # fallback minimal vol
 
-        half_spread = max(tick, self.k_vol * vol)
+        # Establish reference vol if not provided (use median of first full window)
+        if self.vol_ref is None and len(self._price_window) == self.vol_window:
+            self.vol_ref = float(np.median(self._price_window)) * 1e-6 + vol  # avoid zero
+
+        half_spread = max(tick, self.k_vol * vol) + self.extra_spread_ticks * tick
+
+        # ---------------- Adaptive gamma -----------------
+        gamma_dynamic = self.gamma
+
+        # inventory scaling
+        if self.gamma_inv_scale != 0 and self.max_inventory > 0:
+            gamma_dynamic *= 1 + self.gamma_inv_scale * abs(inventory) / self.max_inventory
+
+        # volatility scaling
+        if self.gamma_vol_scale != 0 and self.vol_ref:
+            gamma_dynamic *= 1 + self.gamma_vol_scale * (vol / self.vol_ref)
+
+        # cap gamma to avoid extreme widening
+        gamma_dynamic = min(gamma_dynamic, self.gamma * self.gamma_cap_factor)
 
         # ---------------- Skew -----------------
         if self.use_ticks:
-            skew_px = self.gamma * inventory * tick
+            skew_px = gamma_dynamic * inventory * tick
         else:
-            skew_px = self.gamma * inventory * (best_ask - best_bid)
+            skew_px = gamma_dynamic * inventory * (best_ask - best_bid)
 
         bid_price = micro_price - half_spread - skew_px
         ask_price = micro_price + half_spread - skew_px

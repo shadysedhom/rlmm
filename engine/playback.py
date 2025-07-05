@@ -137,6 +137,16 @@ def main():
     parser.add_argument("--max_competitors", type=int, default=8, help="Maximum competing orders per price level")
     parser.add_argument("--competitor_order_size", type=float, default=0.05, help="Average size of competing orders (BTC)")
     parser.add_argument("--funding_interval", type=float, default=8.0, help="Funding interval in hours (default 8). Use smaller for short simulations")
+    # --- new hedging parameters ---
+    parser.add_argument("--hedge_fraction", type=float, default=1.0, help="Fraction of inventory to hedge when taking out inventory (0-1)")
+    parser.add_argument("--inventory_band", type=float, default=0.0, help="No hedging while |inventory| is below this value (BTC)")
+    parser.add_argument("--momentum_filter", action="store_true", help="Enable momentum filter to skip hedge when price moves in our favour")
+    parser.add_argument("--momentum_lookback", type=int, default=1, help="Number of snapshots to look back for momentum test (>=1)")
+    parser.add_argument("--max_ticks_away", type=int, default=3, help="Cancel/replace order if it drifts more than this many ticks behind the touch")
+    parser.add_argument("--no_cancel_if_behind", action="store_true", help="Disable automatic cancellation of orders that drift behind touch")
+    parser.add_argument("--post_only", action="store_true", help="Enable post-only (protect-on-cross) logic; orders that would cross are canceled")
+    # Sharpe denominator selection
+    parser.add_argument("--sharpe_denominator", type=str, default="capital", choices=["capital", "max_inventory", "notional"], help="What to divide returns by when computing Sharpe: capital (capital_base), max_inventory (max_inventory*mid), or notional (absolute inventory notional per bucket)")
     args = parser.parse_args()
     
     # Set up logging
@@ -197,11 +207,19 @@ def main():
         max_competitors=args.max_competitors,
         competitor_order_size=args.competitor_order_size,
         competition_intensity=args.competition_intensity,
+        cancel_if_behind=not args.no_cancel_if_behind,
+        post_only=args.post_only,
+        max_ticks_away=args.max_ticks_away,
         capital_base=args.capital_base,
         order_ttl_sec=args.order_ttl if args.order_ttl > 0 else None,
         # Funding parameters
         # Convert hours to seconds so we can tweak in short backtests
         funding_interval_sec=int(args.funding_interval * 3600),
+        # Hedging parameters
+        hedge_fraction=args.hedge_fraction,
+        inventory_band=args.inventory_band,
+        momentum_filter=args.momentum_filter,
+        momentum_lookback=args.momentum_lookback,
     )
 
     prev_ts: float | None = None
@@ -360,8 +378,22 @@ def main():
             # Sort buckets chronologically and get end-of-bucket PnLs in order
             ordered_end_pnls = [p for _, p in sorted(bucket_end_pnl.items())]
             if len(ordered_end_pnls) > 1:
-                # Calculate percentage returns: (P&L_t - P&L_{t-1}) / capital_base
-                returns = np.diff(ordered_end_pnls) / args.capital_base
+                # Choose denominator per user option
+                if args.sharpe_denominator == "capital":
+                    denom_series = args.capital_base
+                    returns = np.diff(ordered_end_pnls) / denom_series
+                elif args.sharpe_denominator == "max_inventory":
+                    # Use constant max_inventory * first mid price as risk capital
+                    first_mid = pnl_series[0] * 0 + mid  # mid is last available but okay
+                    denom_series = args.max_inventory * first_mid
+                    returns = np.diff(ordered_end_pnls) / denom_series
+                else:  # notional per bucket: use inventory abs * mid
+                    inv_end = [inv_series[ts_series.index(b_end_ts)] for b_end_ts in sorted(bucket_end_pnl.keys())]
+                    mid_end = [pnl_series[ts_series.index(b_end_ts)] for b_end_ts in sorted(bucket_end_pnl.keys())]
+                    denom_series = np.array([abs(i) * mid if mid else args.capital_base for i, mid in zip(inv_end, mid_end)])
+                    # Avoid division by zero
+                    denom_series = np.where(denom_series == 0, args.capital_base, denom_series)
+                    returns = np.diff(ordered_end_pnls) / denom_series[:-1]
                 
                 if returns.std() > 0:
                     mean_ret = returns.mean()

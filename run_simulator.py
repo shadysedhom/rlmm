@@ -42,6 +42,17 @@ def main():
     parser.add_argument("--max_competitors", type=int, default=8, help="Maximum competing orders per price level")
     parser.add_argument("--competitor_order_size", type=float, default=0.05, help="Average size (BTC) of competing orders")
     parser.add_argument("--funding_interval", type=float, default=8.0, help="Funding interval in hours (perpetual futures)")
+    parser.add_argument("--maker_fee", type=float, default=0.0002, help="Maker fee rate (positive cost, negative rebate)")
+    parser.add_argument("--taker_fee", type=float, default=0.0005, help="Taker fee rate in decimal (e.g., 0.0005 = 5 bps)")
+    parser.add_argument("--hedge_fraction", type=float, default=1.0, help="Fraction of inventory to hedge when taking out inventory (0-1, 1=full)")
+    parser.add_argument("--inventory_band", type=float, default=0.0, help="Skip hedging while |inventory| ≤ band (BTC)")
+    parser.add_argument("--momentum_filter", action="store_true", help="Enable momentum filter to skip hedging when price moves favourably")
+    parser.add_argument("--momentum_lookback", type=int, default=1, help="Number of snapshots to look back for momentum check (>=1)")
+    parser.add_argument("--max_ticks_away", type=int, default=3, help="Cancel order if it drifts more than N ticks behind best bid/ask")
+    parser.add_argument("--no_cancel_if_behind", action="store_true", help="Disable cancel_if_behind logic in playback")
+    parser.add_argument("--post_only", action="store_true", help="Enable post-only protect-on-cross in playback")
+    parser.add_argument("--hold_time", type=float, default=0.5, help="Minimum seconds a quote must rest before it can be replaced")
+    parser.add_argument("--sharpe_denominator", type=str, default="capital", choices=["capital", "max_inventory", "notional"], help="Denominator for Sharpe calc (capital, max_inventory, notional)")
     args = parser.parse_args()
     
     # Create output directory if it doesn't exist
@@ -92,9 +103,9 @@ def main():
         for key, val in cfg_dict.items():
             if hasattr(args, key):
                 current = getattr(args, key)
-                # Skip if CLI already provided a non-default value (argparse sets defaults beforehand)
-                # We approximate by checking if the CLI string is not the parser default
-                if isinstance(current, str) and current != parser.get_default(key):
+                default_val = parser.get_default(key)
+                # Skip override if the user supplied a CLI value different from the default
+                if current != default_val:
                     continue
                 setattr(args, key, val)
 
@@ -135,6 +146,26 @@ def main():
     cmd.extend(["--max_competitors", str(args.max_competitors)])
     cmd.extend(["--competitor_order_size", str(args.competitor_order_size)])
     cmd.extend(["--funding_interval", str(args.funding_interval)])
+    cmd.extend(["--maker_fee", str(args.maker_fee)])
+    cmd.extend(["--taker_fee", str(args.taker_fee)])
+    
+    # Forward hedging parameters
+    cmd.extend(["--hedge_fraction", str(args.hedge_fraction)])
+    cmd.extend(["--inventory_band", str(args.inventory_band)])
+    if args.momentum_filter:
+        cmd.append("--momentum_filter")
+    cmd.extend(["--momentum_lookback", str(args.momentum_lookback)])
+    cmd.extend(["--hold_time", str(args.hold_time)])
+    if args.no_cancel_if_behind:
+        cmd.append("--no_cancel_if_behind")
+    
+    # Forward max_ticks_away parameter
+    cmd.extend(["--max_ticks_away", str(args.max_ticks_away)])
+    
+    # Forward post_only parameter
+    if args.post_only:
+        cmd.append("--post_only")
+    cmd.extend(["--sharpe_denominator", args.sharpe_denominator])
     
     # Print command for reference (unless in quiet mode)
     if not args.quiet:

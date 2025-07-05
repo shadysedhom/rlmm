@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import uuid
 import random
 import numpy as np
+from collections import deque
 
 from engine import logger
 
@@ -36,6 +37,7 @@ class BookSimulator:
         self,
         tick_size: float,
         cancel_if_behind: bool = True,
+        post_only: bool = False,  # If True, cancel orders that would cross the touch (protect-on-cross)
         max_ticks_away: int = 3,
         maker_fee: float = 0.0002,  # 0.02% maker fee for regular users (positive cost, negative rebate)
         maker_rebate: float | None = None,  # deprecated alias (negative maker_fee)
@@ -64,9 +66,15 @@ class BookSimulator:
         forced_liq_slip_bps_low: float = 0.0002,  # 2 bps lower bound for slip
         forced_liq_slip_bps_high: float = 0.0008, # 8 bps upper bound for slip
         funding_interval_sec: int | None = None,
+        # --- new inventory management knobs ---
+        hedge_fraction: float = 1.0,  # 1.0 = hedge full inventory (legacy behaviour). <1 hedges partially
+        inventory_band: float = 0.0,  # Do nothing while |inventory| <= band
+        momentum_filter: bool = False,  # Skip hedge if recent price move favourable
+        momentum_lookback: int = 1,     # How many snapshots to look back for momentum (>=1)
     ):
         self.tick = tick_size
         self.cancel_if_behind = cancel_if_behind
+        self.post_only = post_only
         self.max_ticks_away = max_ticks_away
         # Backward-compat: legacy unit tests pass maker_rebate parameter (positive = rebate)
         if maker_rebate is not None:
@@ -170,8 +178,22 @@ class BookSimulator:
         self.forced_liq_slip_bps_low = forced_liq_slip_bps_low
         self.forced_liq_slip_bps_high = forced_liq_slip_bps_high
 
+        # ----- new hedging parameters -----
+        self.hedge_fraction = max(0.0, min(hedge_fraction, 1.0))
+        self.inventory_band = abs(inventory_band)
+        self.momentum_filter = momentum_filter
+        self.momentum_lookback = max(1, int(momentum_lookback))
+        # Track previous mid price for momentum test (updated each snapshot)
+        self._mom_window: deque[float] = deque(maxlen=self.momentum_lookback)
+        
         # Track previous mid price for inventory move attribution
         self._last_mid_price: float | None = None
+
+        # --- taker volume accounting ---
+        self.taker_qty_hedge = 0.0
+        self.taker_qty_cross = 0.0
+        self.taker_trades_hedge = 0
+        self.taker_trades_cross = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -280,24 +302,37 @@ class BookSimulator:
             )
 
             if crossed and not order.is_filled():
-                remaining_qty = order.size - order.filled
-                if remaining_qty > 0:
-                    trade_price = best_ask if order.side == "buy" else best_bid
-                    self._settle_fill(
-                        order.side,
-                        remaining_qty,
-                        trade_price,
-                        snapshot["ts"],  # placed_ts == current_ts → taker
-                        snapshot["ts"],
-                        best_bid,
-                        best_ask,
-                        order_id=order.order_id,
-                    )
-                    order.filled = order.size  # fully filled
+                if self.post_only:
+                    # Cancel instead of crossing – protect-on-cross
+                    logger.info("Post-only protection: canceling stale quote that would cross",
+                                order_id=order.order_id,
+                                side=order.side,
+                                price=order.price,
+                                best_bid=best_bid,
+                                best_ask=best_ask,
+                                event=logger.OrderEvent.CANCELED)
+                    # Do not add to still_live; treated as canceled
+                    # Ensure we don't count it for fills
+                    continue
+                else:
+                    remaining_qty = order.size - order.filled
+                    if remaining_qty > 0:
+                        trade_price = best_ask if order.side == "buy" else best_bid
+                        self._settle_fill(
+                            order.side,
+                            remaining_qty,
+                            trade_price,
+                            snapshot["ts"],  # placed_ts == current_ts → taker
+                            snapshot["ts"],
+                            best_bid,
+                            best_ask,
+                            order_id=order.order_id,
+                        )
+                        order.filled = order.size  # fully filled
 
-                    # Record in filled orders list for accounting consistency
-                if order not in self.filled_orders:
-                    self.filled_orders.append(order)
+                        # Record in filled orders list for accounting consistency
+                    if order not in self.filled_orders:
+                        self.filled_orders.append(order)
 
             # After potential stale-quote fill, skip further processing if filled
             if order.is_filled():
@@ -408,9 +443,14 @@ class BookSimulator:
                 still_live.append(order)
 
         self.active_orders = still_live
+
+        # ---------- New: proactive hedging before forced liquidation ----------
+        self._hedge_inventory(snapshot)
+
+        # Validate state after all inventory-affecting actions
         self._validate_state(snapshot)
 
-        # After processing normal queue logic, enforce inventory limit via taker trades if necessary
+        # After proactive hedging, enforce hard inventory limit via forced liquidation if necessary
         self._liquidate_if_needed(snapshot)
 
     # ------------------------------------------------------------------
@@ -576,12 +616,21 @@ class BookSimulator:
                 )
 
                 if crossed:
+                    if self.post_only:
+                        logger.info("Post-only protection: cancelling pending order that would cross",
+                                    order_id=order_id,
+                                    side=side,
+                                    price=price,
+                                    best_bid=best_bid,
+                                    best_ask=best_ask,
+                                    event=logger.OrderEvent.CANCELED)
+                        continue  # skip activation, effectively canceled
                     trade_price = best_ask if side == "buy" else best_bid
                     self._settle_fill(
                         side,
                         size,
                         trade_price,
-                        snapshot["ts"],  # placed == arrival, taker
+                        snapshot["ts"],
                         snapshot["ts"],
                         best_bid,
                         best_ask,
@@ -703,6 +752,15 @@ class BookSimulator:
             fee = notional * self.taker_fee
             self.cash -= fee
             self.pnl_components["fees"] -= fee
+
+            # ------------- taker volume categorisation -------------
+            if order_id.startswith("HEDGE"):
+                self.taker_qty_hedge += qty
+                self.taker_trades_hedge += 1
+            else:
+                self.taker_qty_cross += qty  # includes stale-quote, pending, forced-liq
+                self.taker_trades_cross += 1
+
             logger.debug("Taker fee applied", 
                         order_id=order_id,
                         fee=fee,
@@ -931,12 +989,12 @@ class BookSimulator:
         metrics["orders_placed"] = self.orders_placed
         metrics["orders_placed_buy"] = self.orders_placed_side["buy"]
         metrics["orders_placed_sell"] = self.orders_placed_side["sell"]
-        metrics["orders_filled"] = self.orders_filled
-        metrics["orders_filled_buy"] = self.orders_filled_side["buy"]
-        metrics["orders_filled_sell"] = self.orders_filled_side["sell"]
-        metrics["order_fill_rate_qty"] = (
-            self.maker_qty_filled / self.maker_qty_placed if self.maker_qty_placed else 0.0
-        )
+        # metrics["orders_filled"] = self.orders_filled
+        # metrics["orders_filled_buy"] = self.orders_filled_side["buy"]
+        # metrics["orders_filled_sell"] = self.orders_filled_side["sell"]
+        # metrics["order_fill_rate_qty"] = (
+        #     self.maker_qty_filled / self.maker_qty_placed if self.maker_qty_placed else 0.0
+        # )
         metrics["maker_qty_placed"] = self.maker_qty_placed
         metrics["maker_qty_filled"] = self.maker_qty_filled
         metrics["maker_fill_qty_rate"] = self.maker_qty_filled / self.maker_qty_placed if self.maker_qty_placed else 0.0
@@ -951,6 +1009,13 @@ class BookSimulator:
         metrics["forced_liquidations"] = self.forced_liquidations
         metrics["avg_forced_liq_cost"] = float(np.mean(self.forced_liq_costs)) if self.forced_liq_costs else 0.0
         metrics["std_forced_liq_cost"] = float(np.std(self.forced_liq_costs)) if self.forced_liq_costs else 0.0
+
+        # taker volume split
+        metrics["taker_qty_hedge"] = self.taker_qty_hedge
+        metrics["taker_qty_cross"] = self.taker_qty_cross
+        metrics["taker_trades_hedge"] = self.taker_trades_hedge
+        metrics["taker_trades_cross"] = self.taker_trades_cross
+        metrics["taker_qty_total"] = self.taker_qty_hedge + self.taker_qty_cross
 
         return metrics
 
@@ -978,3 +1043,67 @@ class BookSimulator:
             next_ts = self.last_funding_ts + periods_ahead * self.funding_interval
 
         return next_ts - current_ts
+
+    # ------------------------------------------------------------------
+    # Proactive hedging helper (partial, band, momentum-aware)
+    # ------------------------------------------------------------------
+    def _hedge_inventory(self, snapshot: dict):
+        """Optionally cross a fraction of outstanding inventory to reduce taker usage.
+
+        Conditions:
+        1. |inventory| > inventory_band (otherwise do nothing).
+        2. If momentum_filter is enabled and last mid-price move is favourable, skip this snapshot.
+        3. Cross hedge_fraction × (|inventory| - inventory_band) at touch price.
+        """
+        if self.hedge_fraction <= 0:
+            return  # disabled
+
+        # Compute mid price for momentum test & attribution fallback
+        best_bid = snapshot["bids"][0][0]
+        best_ask = snapshot["asks"][0][0]
+        mid = snapshot.get("mid", (best_bid + best_ask) / 2.0)
+
+        # Momentum test: lookback window
+        if self.momentum_filter:
+            self._mom_window.append(mid)
+            if len(self._mom_window) == self.momentum_lookback:
+                price_change = mid - self._mom_window[0]
+                if (self.inventory > 0 and price_change > 0) or (self.inventory < 0 and price_change < 0):
+                    # Momentum favourable → delay hedge
+                    return  # keep window intact
+
+        excess_inv = abs(self.inventory) - self.inventory_band
+        if excess_inv <= 1e-9:
+            return  # within band – no hedge
+
+        qty = self.hedge_fraction * excess_inv
+        if qty <= 1e-9:
+            return
+
+        side = "sell" if self.inventory > 0 else "buy"
+        price = best_bid if side == "sell" else best_ask
+
+        hedge_id = "HEDGE" + str(uuid.uuid4())[:6]
+
+        # Execute taker trade immediately
+        self._settle_fill(
+            side,
+            qty,
+            price,
+            snapshot["ts"],  # placed_ts == current_ts → taker
+            snapshot["ts"],
+            best_bid,
+            best_ask,
+            order_id=hedge_id,
+        )
+
+        logger.debug(
+            "Proactive hedge executed",
+            side=side,
+            qty=qty,
+            price=price,
+            inventory_post=self.inventory,
+            event=logger.OrderEvent.FORCED_LIQ,  # reuse enum for now
+        )
+
+        self._mom_window.append(mid)

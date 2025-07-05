@@ -1,0 +1,50 @@
+{
+  "final_pnl": -3.375772640636569,
+  "final_inventory": 0.001678977261135022,
+  "fill_count": 271,
+  "max_drawdown": 3.375772640636569,
+  "pnl_attribution": {
+    "inventory_moves": -0.22046691231228815,
+    "fees": -3.460654866637911,
+    "spread_capture": 0.4059030661248246,
+    "adverse_selection": -0.09790967640175029,
+    "funding_rates": 0.0
+  },
+  "additional_metrics": {
+    "orders_placed": 536,
+    "orders_placed_buy": 263,
+    "orders_placed_sell": 273,
+    "maker_qty_placed": 3.078940838279053,
+    "maker_qty_filled": 0.6427481710935621,
+    "maker_fill_qty_rate": 0.20875625900393088,
+    "avg_fill_latency_sec": 0.19191557865638237,
+    "std_fill_latency_sec": 0.10979632398287928,
+    "avg_queue_position": 1.1332575782944405,
+    "std_queue_position": 1.398609994777423,
+    "avg_order_lifetime_sec": 0.20495453747836026,
+    "std_order_lifetime_sec": 0.10474522405537202,
+    "avg_competition_size": 0.6596111602190506,
+    "std_competition_size": 0.1258456641609162,
+    "forced_liquidations": 0,
+    "avg_forced_liq_cost": 0.0,
+    "std_forced_liq_cost": 0.0
+  },
+  "strategy": "skew_mid_spread",
+  "strategy_kwargs": {
+    "gamma": 0.1,
+    "gamma_cap_factor": 5.0,
+    "gamma_imb": 0.5,
+    "gamma_inv_scale": 4.0,
+    "gamma_vol_scale": 2.0,
+    "gradient_penalty_ticks": 1.0,
+    "gradient_threshold": 1.5,
+    "k_vol": 1.3,
+    "size_base": 0.01,
+    "size_exp": 2.0,
+    "size_min_factor": 0.2
+  },
+  "snapshots_processed": 1000,
+  "sharpe_ratio": -1.2586925545813652,
+  "capital_base": 10000.0,
+  "sharpe_horizon_seconds": 60.0
+}
