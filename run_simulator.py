@@ -20,7 +20,7 @@ except ImportError:  # Fallback when PyYAML not installed
 
 def main():
     parser = argparse.ArgumentParser(description="Run market-making simulator with appropriate parameters")
-    parser.add_argument("--strategy", default="mid_spread", help="Strategy to use (mid_spread or skew_mid_spread)")
+    parser.add_argument("--strategy", default="skew_mid_spread", help="Strategy to use (mid_spread or skew_mid_spread)")
     parser.add_argument("--max_snapshots", type=int, default=10000, help="Maximum number of snapshots to process")
     parser.add_argument("--log_level", default="INFO", help="Logging level (TRACE, DEBUG, INFO, WARNING, ERROR)")
     parser.add_argument("--log_throttle", type=int, default=10, help="Only log every N snapshots to reduce verbosity (0 = log all snapshots)")
@@ -53,6 +53,7 @@ def main():
     parser.add_argument("--post_only", action="store_true", help="Enable post-only protect-on-cross in playback")
     parser.add_argument("--hold_time", type=float, default=0.5, help="Minimum seconds a quote must rest before it can be replaced")
     parser.add_argument("--sharpe_denominator", type=str, default="capital", choices=["capital", "max_inventory", "notional"], help="Denominator for Sharpe calc (capital, max_inventory, notional)")
+    parser.add_argument("--sharpe_horizon", type=float, default=60.0, help="Seconds per return bucket for Sharpe ratio (e.g., 3600 = 1-hour Sharpe)")
     args = parser.parse_args()
     
     # Create output directory if it doesn't exist
@@ -166,6 +167,7 @@ def main():
     if args.post_only:
         cmd.append("--post_only")
     cmd.extend(["--sharpe_denominator", args.sharpe_denominator])
+    cmd.extend(["--sharpe_horizon", str(args.sharpe_horizon)])
     
     # Print command for reference (unless in quiet mode)
     if not args.quiet:

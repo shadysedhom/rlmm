@@ -12,6 +12,7 @@ import uuid
 import random
 import numpy as np
 from collections import deque
+import math
 
 from engine import logger
 
@@ -50,6 +51,9 @@ class BookSimulator:
         partial_fill_rate: float = 0.05,      # 5% of fills are partial
         execution_slippage_bps: float = 0.5,  # 0.5 bps average slippage
         queue_position_uncertainty: float = 0.1,  # 10% uncertainty in queue position
+        # --- depth realism knobs ---
+        depth_decay_ticks: float = 15.0,  # e-folding depth (ticks) for competition count decay
+        min_queue_ahead: float = 0.25,    # Minimum BTC ahead to avoid unrealistically empty queue
         # Queue competition parameters
         min_competitors: int = 3,             # Minimum competing orders per price level (tougher)
         max_competitors: int = 8,             # Maximum competing orders per price level (tougher)
@@ -90,7 +94,10 @@ class BookSimulator:
         self.partial_fill_rate = partial_fill_rate
         self.execution_slippage_bps = execution_slippage_bps
         self.queue_position_uncertainty = queue_position_uncertainty
-        # Competition parameters
+        # --- depth realism knobs ---
+        self.depth_decay_ticks = max(1e-6, depth_decay_ticks)
+        self.min_queue_ahead = max(0.0, min_queue_ahead)
+        # Queue competition parameters
         self.min_competitors = min_competitors
         self.max_competitors = max_competitors
         self.competitor_order_size = competitor_order_size
@@ -195,6 +202,17 @@ class BookSimulator:
         self.taker_trades_hedge = 0
         self.taker_trades_cross = 0
 
+        # -----------------------------------------------------------
+        # Cumulative traded notional (turnover) tracking
+        # These count every fill once (maker or taker, buy or sell)
+        #   • notional_traded_btc : absolute BTC volume traded
+        #   • notional_traded_usdt: corresponding USDT value at fill price
+        # -----------------------------------------------------------
+        self.notional_traded_btc: float = 0.0
+        self.notional_traded_usdt: float = 0.0
+
+        self.depth_decay_ticks = max(1e-6, depth_decay_ticks)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -207,6 +225,12 @@ class BookSimulator:
         """
         # First, promote any pending orders whose latency has elapsed using this snapshot
         self._activate_pending(snapshot)
+
+        # Clamp desired prices within visible depth (avoid quoting outside snapshot depth)
+        deepest_bid = snapshot["bids"][-1][0]
+        deepest_ask = snapshot["asks"][-1][0]
+        bid_price = max(bid_price, deepest_bid)
+        ask_price = min(ask_price, deepest_ask)
 
         # Separate existing orders by side for easy lookup
         buy_ord = next((o for o in self.active_orders if o.side == "buy" and not o.is_filled()), None)
@@ -377,7 +401,18 @@ class BookSimulator:
                     # The larger the traded volume (executed_against_us) relative to the depth in front of us
                     # plus our own remaining size, the higher the probability of getting hit.
                     depth_ahead = adjusted_queue_ahead + remaining_qty
+                    # Base probability from queue depletion
                     fill_probability = min(1.0, executed_against_us / (depth_ahead + 1e-9))
+
+                    # Further scale probability by distance from touch (deeper quotes fill less)
+                    depth_ticks = (
+                        (best_bid - order.price) / self.tick
+                        if order.side == "buy"
+                        else (order.price - best_ask) / self.tick
+                    )
+                    depth_ticks = max(depth_ticks, 0.0)
+                    distance_factor = 1.0 / (1.0 + depth_ticks / 5.0)  # gentler decay: 1 at touch, 0.2 at 20 ticks
+                    fill_probability *= distance_factor
 
                     # Decide if this traded volume actually hits us (probabilistic).
                     if random.random() < fill_probability:
@@ -685,10 +720,12 @@ class BookSimulator:
                 break
         
         # Calculate competing orders that will be placed ahead of us
-        competing_size = self._calculate_competing_orders(price, size)
+        competing_size = self._calculate_competing_orders(price, size, snapshot)
         self.competition_sizes.append(competing_size)
         # Our queue position = visible size + competing orders
         queue_ahead = visible + competing_size
+        if queue_ahead < self.min_queue_ahead:
+            queue_ahead = self.min_queue_ahead
                 
         if order_id is None:
             order_id = str(uuid.uuid4())[:8]
@@ -799,6 +836,15 @@ class BookSimulator:
         self.fill_queue_positions.append(queue_pos)
         lifetime = current_ts - self.order_place_times.get(order_id, current_ts)
         self.order_lifetimes.append(lifetime)
+
+        # -----------------------------------------------------------
+        # Cumulative traded notional (turnover) tracking
+        # These count every fill once (maker or taker, buy or sell)
+        #   • notional_traded_btc : absolute BTC volume traded
+        #   • notional_traded_usdt: corresponding USDT value at fill price
+        # -----------------------------------------------------------
+        self.notional_traded_btc += qty
+        self.notional_traded_usdt += notional
 
     # ------------------------------------------------------------------
     # Inventory liquidation helper
@@ -913,15 +959,29 @@ class BookSimulator:
     # ------------------------------------------------------------------
     # Competition modeling
     # ------------------------------------------------------------------
-    def _calculate_competing_orders(self, price_level: float, our_order_size: float) -> float:
+    def _calculate_competing_orders(self, price_level: float, our_order_size: float, snapshot: dict) -> float:
         """Calculate the size of competing orders that will be placed ahead of us in the queue.
         
         This models other market makers competing for the same opportunities.
         Competition intensity varies based on market conditions and our order size.
         """
-        # Base number of competitors based on competition intensity (scaled up for realism)
+        # --- depth-aware decay ------------------------------------------------
+        best_bid = snapshot["bids"][0][0]
+        best_ask = snapshot["asks"][0][0]
+
+        if price_level <= best_bid:  # buy quote (<= ensures works if equal)
+            depth_ticks = max(0.0, (best_bid - price_level) / self.tick)
+        elif price_level >= best_ask:  # sell quote
+            depth_ticks = max(0.0, (price_level - best_ask) / self.tick)
+        else:
+            depth_ticks = 0.0  # inside spread (rare with our model)
+
+        # Exponential decay of competitors with depth (more depth → fewer rivals)
+        depth_factor = math.exp(-depth_ticks / self.depth_decay_ticks)
+
+        # Base competitors count decays with depth
         base_competitors = self.min_competitors + int(
-            (self.max_competitors - self.min_competitors) * self.competition_intensity * 1.5
+            (self.max_competitors - self.min_competitors) * self.competition_intensity * depth_factor
         )
         
         # Add some randomness to make it more realistic
@@ -930,19 +990,20 @@ class BookSimulator:
             min(self.max_competitors, base_competitors + 1)
         )
         
-        # Calculate total competing order size (increase multiplier for tougher fills)
-        size_multiplier = 1.0 + (our_order_size / self.competitor_order_size) * 1.0
+        # Competing size independent of depth (count already decays)
+        size_multiplier = 1.0 + (our_order_size / self.competitor_order_size)
         competing_size = num_competitors * self.competitor_order_size * size_multiplier
         
-        # Add heavier-tailed randomness to competing order sizes
-        competing_size *= random.uniform(1.0, 2.0)  # 1-2× for more variance
-        
-        logger.debug("Competing orders calculated", 
-                    price_level=price_level,
-                    our_order_size=our_order_size,
-                    num_competitors=num_competitors,
-                    competing_size=competing_size,
-                    competition_intensity=self.competition_intensity)
+        logger.debug(
+            "Competing orders calculated",
+            price_level=price_level,
+            our_order_size=our_order_size,
+            num_competitors=num_competitors,
+            depth_ticks=depth_ticks,
+            depth_factor=depth_factor,
+            competing_size=competing_size,
+            competition_intensity=self.competition_intensity,
+        )
         
         return competing_size
 
@@ -1017,6 +1078,15 @@ class BookSimulator:
         metrics["taker_trades_cross"] = self.taker_trades_cross
         metrics["taker_qty_total"] = self.taker_qty_hedge + self.taker_qty_cross
 
+        # -----------------------------------------------------------
+        # Cumulative traded notional (turnover) tracking
+        # These count every fill once (maker or taker, buy or sell)
+        #   • notional_traded_btc : absolute BTC volume traded
+        #   • notional_traded_usdt: corresponding USDT value at fill price
+        # -----------------------------------------------------------
+        metrics["notional_traded_btc"] = self.notional_traded_btc
+        metrics["notional_traded_usdt"] = self.notional_traded_usdt
+
         return metrics
 
     def _mark_order_filled(self, order: Order):
@@ -1055,8 +1125,7 @@ class BookSimulator:
         2. If momentum_filter is enabled and last mid-price move is favourable, skip this snapshot.
         3. Cross hedge_fraction × (|inventory| - inventory_band) at touch price.
         """
-        if self.hedge_fraction <= 0:
-            return  # disabled
+        # Fractional hedging removed: we always hedge the full excess inventory.
 
         # Compute mid price for momentum test & attribution fallback
         best_bid = snapshot["bids"][0][0]
@@ -1076,7 +1145,7 @@ class BookSimulator:
         if excess_inv <= 1e-9:
             return  # within band – no hedge
 
-        qty = self.hedge_fraction * excess_inv
+        qty = excess_inv  # hedge the entire excess inventory in one taker trade
         if qty <= 1e-9:
             return
 

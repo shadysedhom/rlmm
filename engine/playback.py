@@ -365,59 +365,51 @@ def main():
             
             logger.info(f"Maximum drawdown: {max_drawdown:.4f} USDT ({max_drawdown/args.capital_base*100:.4f}% of capital)")
         
-        # ------------------ Sharpe Ratio ------------------
-        # 1. Aggregate P&L into fixed-length buckets (args.sharpe_horizon sec)
-        # 2. Compute % return of each bucket relative to nominal capital_base
-        # 3. Sharpe = (mean - rf) / std * sqrt(periods_per_year)
-        if args.sharpe_horizon > 0 and len(ts_series) > 2:
-            bucket_end_pnl: dict[int, float] = {}
-            for ts, pnl in zip(ts_series, pnl_series):
-                bucket_idx = int(ts // args.sharpe_horizon)
-                bucket_end_pnl[bucket_idx] = pnl  # overwrite -> keep last in bucket
-
-            # Sort buckets chronologically and get end-of-bucket PnLs in order
-            ordered_end_pnls = [p for _, p in sorted(bucket_end_pnl.items())]
-            if len(ordered_end_pnls) > 1:
-                # Choose denominator per user option
-                if args.sharpe_denominator == "capital":
-                    denom_series = args.capital_base
-                    returns = np.diff(ordered_end_pnls) / denom_series
-                elif args.sharpe_denominator == "max_inventory":
-                    # Use constant max_inventory * first mid price as risk capital
-                    first_mid = pnl_series[0] * 0 + mid  # mid is last available but okay
-                    denom_series = args.max_inventory * first_mid
-                    returns = np.diff(ordered_end_pnls) / denom_series
-                else:  # notional per bucket: use inventory abs * mid
-                    inv_end = [inv_series[ts_series.index(b_end_ts)] for b_end_ts in sorted(bucket_end_pnl.keys())]
-                    mid_end = [pnl_series[ts_series.index(b_end_ts)] for b_end_ts in sorted(bucket_end_pnl.keys())]
-                    denom_series = np.array([abs(i) * mid if mid else args.capital_base for i, mid in zip(inv_end, mid_end)])
-                    # Avoid division by zero
-                    denom_series = np.where(denom_series == 0, args.capital_base, denom_series)
-                    returns = np.diff(ordered_end_pnls) / denom_series[:-1]
+        # ------------------ Sharpe Ratio (Industry Standard) ------------------
+        # Industry standard: Only annualize if we have sufficient data (>30 days)
+        # Otherwise report non-annualized Sharpe ratio
+        if len(pnl_series) > 10 and len(ts_series) > 1:  # Need minimum data points
+            # Calculate simple returns from portfolio values
+            portfolio_returns = np.diff(pnl_series) / args.capital_base
+            
+            if len(portfolio_returns) > 1 and np.std(portfolio_returns) > 0:
+                mean_return = np.mean(portfolio_returns)
+                std_return = np.std(portfolio_returns)
+                risk_free_rate = 0.0  # Assume 0% risk-free rate
                 
-                if returns.std() > 0:
-                    mean_ret = returns.mean()
-                    std_ret = returns.std()
+                # Calculate actual simulation duration
+                simulation_duration_seconds = ts_series[-1] - ts_series[0]
+                simulation_duration_days = simulation_duration_seconds / (24 * 3600)
+                
+                # Industry standard: Only annualize if we have >30 days of data
+                if simulation_duration_days >= 30:
+                    # Standard annualization for sufficient data
+                    returns_per_year = len(portfolio_returns) / (simulation_duration_seconds / (365.25 * 24 * 3600))
+                    annualized_volatility = std_return * math.sqrt(returns_per_year)
                     
-                    # Calculate Sharpe ratio without annualization for the actual period
-                    # This is more realistic than extrapolating 80 minutes to a full year
-                    risk_free_rate = 0.0
+                    total_return = final_pnl / args.capital_base
+                    annualized_return = total_return / (simulation_duration_days / 365.25)
                     
-                    sharpe = (mean_ret - risk_free_rate) / std_ret
-                    logger.info(
-                        f"Sharpe ratio (period: {len(returns)} buckets, capital {args.capital_base:.0f} USDT, "
-                        f"horizon {args.sharpe_horizon:.0f}s): {sharpe:.4f}"
-                    )
-                    logger.info(
-                        f"Sharpe details: mean_ret={mean_ret:.6f}, std_ret={std_ret:.6f}, "
-                        f"periods={len(returns)}"
-                    )
+                    sharpe = (annualized_return - risk_free_rate) / annualized_volatility
+                    
+                    logger.info(f"Sharpe ratio (annualized): {sharpe:.4f}")
+                    logger.info(f"Simulation duration: {simulation_duration_days:.1f} days")
+                    logger.info(f"Annualized return: {annualized_return:.4f} ({annualized_return*100:.2f}%)")
+                    logger.info(f"Annualized volatility: {annualized_volatility:.4f} ({annualized_volatility*100:.2f}%)")
                 else:
-                    logger.info("Sharpe ratio: infinite (zero return std deviation)")
+                    # Non-annualized Sharpe for short periods (industry standard)
+                    sharpe = (mean_return - risk_free_rate) / std_return
+                    total_return = final_pnl / args.capital_base
+                    
+                    logger.info(f"Sharpe ratio (non-annualized): {sharpe:.4f}")
+                    logger.info(f"Simulation duration: {simulation_duration_days:.1f} days (too short for annualization)")
+                    logger.info(f"Total return: {total_return:.4f} ({total_return*100:.2f}%)")
+                    logger.info(f"Return volatility: {std_return:.6f} ({std_return*100:.4f}%)")
+                    logger.info(f"Note: Industry standard requires >30 days for meaningful annualized Sharpe")
             else:
-                logger.info("Not enough buckets to compute Sharpe ratio")
+                logger.info("Sharpe ratio: undefined (insufficient return variation)")
         else:
-            logger.info("Sharpe ratio not computed (invalid horizon or data length)")
+            logger.info("Sharpe ratio: undefined (insufficient data points)")
         
         # Get P&L attribution
         pnl_attribution = book.get_pnl_attribution()

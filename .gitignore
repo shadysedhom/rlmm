@@ -3,4 +3,12 @@
 /data/raw/
 
 # Old files
-/OLD
+/Old
+
+# Too large files
+/results/mid_spread_simulation.log
+
+
+# Notes
+NOTES.md
+

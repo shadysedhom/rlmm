@@ -1,0 +1,37 @@
+================================================================================
+REINFORCEMENT LEARNING vs BASELINE COMPARISON REPORT
+================================================================================
+
+Generated: 2025-07-10 19:35:56
+Configuration: PPO_MarketMaker_v1_fast
+
+REINFORCEMENT LEARNING AGENT PERFORMANCE:
+--------------------------------------------------
+Mean Episode Reward: -20.215134
+Std Episode Reward:  54.783718
+Min Episode Reward:  -184.141815
+Max Episode Reward:  0.085943
+Average Total P&L:     -34.85
+Average Fill Count:    213.9
+Average Max Inventory: 0.05
+
+BASELINE STRATEGY PERFORMANCE:
+--------------------------------------------------
+Final P&L:      -13.74
+Fill Count:     59
+Max Inventory:  0.00
+
+P&L Attribution:
+  inventory_moves: 0.00
+  fees: -17.16
+  spread_capture: 4.19
+  adverse_selection: -0.56
+  funding_rates: 0.00
+
+PERFORMANCE COMPARISON:
+--------------------------------------------------
+RL Agent Avg P&L:    -34.85
+Baseline P&L:        -13.74
+Improvement:         -153.7%
+
+================================================================================

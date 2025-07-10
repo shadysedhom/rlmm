@@ -1,60 +1,55 @@
-# Example configuration for run_simulator.py
-# You can copy this file and modify values as needed, then call:
-#   py run_simulator.py --config configs/my_preset.yaml
+# MAKER-OPTIMIZED STRATEGY
+# FOCUS: Maximize 0% maker fills, minimize 2.4bps taker hedges
 
 strategy: skew_mid_spread
-max_snapshots: 5000
+max_snapshots: 10000
 log_level: INFO
 log_throttle: 10
 print_interval: 5000
 
+# MINIMIZE TAKER HEDGING
+momentum_filter: true       
+momentum_lookback: 4        # More conservative hedging
+post_only: true             
 
-hedge_fraction: 0.05        # turn off fractional hedging
-momentum_filter: true       # skip hedge if the last price move helps
-momentum_lookback: 2        # Need 2 snapshot of favorable price move to defer the hedge
-post_only: true             # post only orders
-
-inventory_band: 0.1         # do nothing within ±X BTC of this range
-max_inventory: 0.5 # in BTC (best from param search 0.05)
+inventory_band: 3.0         # CHANGED: larger band to avoid frequent hedging
+max_inventory: 20           
 sharpe_denominator: max_inventory
 
+hedge_fraction: 0.4         # CHANGED: minimal hedging when it happens
 
-# Playback / engine parameters
-order_ttl: 1.2 # seconds (best from param search 0.6)
-hold_time: 1.0 # seconds 
+# Keep realistic market conditions
+order_ttl: 0.6 
+hold_time: 0.5              # CHANGED: faster updates for better inventory management
 cancel_if_behind: true
-max_ticks_away: 8 # Cancel and replace if order drifts farther than this many ticks
-# Started w/ Inter-continental retail route (Amsterdam -> Binance Singapore) at 135ms mean latency, which is heavy on performance
-latency_mean_ms: 15 # Low latency regional cloud, improves performance
+max_ticks_away: 5           # CHANGED: tighter control
+latency_mean_ms: 15         
 latency_std_ms: 5
-competition_intensity: 0.9 # 0=no competition, 1=high competition
-min_competitors: 3 # Minimum competing orders per price level (tougher)
-max_competitors: 8 # Maximum competing orders per price level (tougher)
-competitor_order_size: 0.05 # in BTC
-funding_interval: 8.0 # Once every 8 hours for perpetual futures
+competition_intensity: 0.9  
+min_competitors: 3          
+max_competitors: 8          
+competitor_order_size: 0.05 
+funding_interval: 8.0
 
-# Strategy parameters (dict will be converted to k=v string automatically)
+# EXTREME INVENTORY SKEWING - let the strategy balance itself
 strategy_kwargs:
-  size_base: 0.01 # (best from param search 0.005)
-  k_vol: 4.5 
-  extra_spread_ticks: 2
-  gamma: 0.08
-  gradient_threshold: 1.5
-  gradient_penalty_ticks: 1
-  gamma_imb: 0.5   # depth-imbalance skew coefficient (ticks per full +/- imbalance)
-  gamma_inv_scale: 4.0 # inventory skew coefficient (ticks per full +/- imbalance)
-  gamma_vol_scale: 2.0 # volatility skew coefficient (ticks per full +/- imbalance)
-  gamma_cap_factor: 5.0 # cap skew coefficient (ticks per full +/- imbalance)
-  size_min_factor: 0.3 # minimum size fraction when inventory high
-  size_exp: 2.0 # exponent for sizing curve
+  size_base: 0.4            # CHANGED: reasonable base size
+  k_vol: 3.0                # CHANGED: tighter spreads for better fills
+  extra_spread_ticks: 15    # CHANGED: minimal padding
+  gamma: 0.50               # CHANGED: very aggressive inventory skewing
+  gradient_threshold: 1.0   # CHANGED: very sensitive to thin books
+  gradient_penalty_ticks: 3 # CHANGED: strong penalty for thin books
+  gamma_imb: 1.0            # CHANGED: very strong imbalance response
+  gamma_inv_scale: 6.0      # CHANGED: extreme inventory-based skewing
+  gamma_vol_scale: 2.0      # CHANGED: strong volatility response
+  gamma_cap_factor: 10.0    # CHANGED: allow very high gamma when needed
+  size_min_factor: 0.05     # CHANGED: very small size when inventory high
+  size_exp: 3.5             # CHANGED: aggressive sizing curve
+  use_ticks: true           # Use tick-based gamma for precision
+  clamp_ticks: 2            # CHANGED: keep heavy side close to touch
 
-# Data directory (relative to project root)
 data_dir: data/converted/binance
-
-# Output directory
 output_dir: ./results
 
-# positive = fee, negative = rebate. Started with 0.0002 maker fee, 0.0005 taker fee (Binance Regular User).
-# Improved status to Binance VIP 2 (Binance has VIP Tiers up to 9), which lowered the fees to 0.00014 maker fee, 0.00035 taker fee.
-maker_fee: 0.00014
-taker_fee: 0.00035
+maker_fee: 0.0              # FREE MONEY!
+taker_fee: 0.00024          # EXPENSIVE - avoid at all costs

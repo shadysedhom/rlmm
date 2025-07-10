@@ -1,0 +1,40 @@
+cancel_if_behind: true
+competition_intensity: 0.9
+competitor_order_size: 0.05
+data_dir: data/converted/binance
+funding_interval: 8.0
+hedge_fraction: 1.0
+hold_time: 1.0
+inventory_band: 0.1
+latency_mean_ms: 15
+latency_std_ms: 5
+log_level: INFO
+log_throttle: 10
+maker_fee: 0.0
+max_competitors: 8
+max_inventory: 0.5
+max_snapshots: 10000
+max_ticks_away: 8
+min_competitors: 3
+momentum_filter: true
+momentum_lookback: 2
+order_ttl: 1.2
+output_dir: results\grid_search\run_8f187410
+post_only: true
+print_interval: 5000
+sharpe_denominator: max_inventory
+strategy: skew_mid_spread
+strategy_kwargs:
+  extra_spread_ticks: 20
+  gamma: 0.12
+  gamma_cap_factor: 5.0
+  gamma_imb: 0.5
+  gamma_inv_scale: 1.0
+  gamma_vol_scale: 2.0
+  gradient_penalty_ticks: 1
+  gradient_threshold: 1.5
+  k_vol: 6
+  size_base: 0.04
+  size_exp: 2.0
+  size_min_factor: 0.3
+taker_fee: 0.00024
